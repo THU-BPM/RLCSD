@@ -43,7 +43,17 @@ RLCSD_LOSS_MODES = {"rlcsd","rlsd_ectr", "opsd_ectr"}
 # ballooning per-rollout teacher-forward cost.
 RLCSD_DEFAULT_K_MAX = 4
 DISTILL_LOSS_MODES = {"opsd", "sdpo", "rlsd", "srpo", *RLCSD_LOSS_MODES}
-MATH_DATA_SOURCES = {"dapo_math_17k", "openthoughts_114k_math_filtered", "amc23", "aime24", "aime25"}
+MATH_DATA_SOURCES = {
+    "dapo_math_17k",
+    "openthoughts_114k_math_filtered",
+    "deepmath_filtered",
+    "deepmath_filtered_level5_7",
+    "deepmath_filtered_level6_8",
+    "deepmath_filtered_level7_10",
+    "amc23",
+    "aime24",
+    "aime25",
+}
 
 
 # ------------------------------------------------------------------ #

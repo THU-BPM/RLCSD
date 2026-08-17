@@ -6,6 +6,19 @@
 
 </div>
 
+## News
+
+- **2026-08-17** — Added `correct_privileged_hint_source=gt_cot`, which uses
+  the dataset-provided ground-truth reasoning trace as RLCSD's correct
+  privileged hint. The [main results](#main-results-across-model-scales) now
+  report both GT CoT and self-rollout variants. Overall, self-rollout remains
+  the more stable default, especially on larger-model logical reasoning and
+  Olmo-3-7B, while GT CoT achieves higher scores on several datasets.
+- **2026-06-05** — Initial open-source release of the RLCSD training code,
+  experiment configurations, and evaluation setup.
+
+## Introduction
+
 On-policy self-distillation (OPSD) gives reasoning models dense, token-level
 supervision by aligning a model's own distribution with the distribution it
 produces under a privileged context (typically a verified solution). We show
@@ -171,6 +184,16 @@ override individual hyperparameters, append Hydra-style overrides:
 bash scripts/math_deepmath/run_qwen3_4b_rlcsd.sh learning_rate=2e-6 group_size=16
 ```
 
+RLCSD uses a verified sibling rollout as its correct privileged hint by
+default. Set `correct_privileged_hint_source` to `gt_cot` to use the dataset's
+ground-truth `extra_info.solution` for the correct branch instead; the wrong
+branch still comes from incorrect sibling rollouts and excludes the target
+itself when the target is incorrect:
+
+```bash
+bash scripts/math_deepmath/run_qwen3_4b_rlcsd.sh correct_privileged_hint_source=gt_cot
+```
+
 Common environment overrides:
 
 - `SWANLAB_API_KEY` — for swanlab logging (set `use_swanlab: true` in configs)
@@ -181,14 +204,12 @@ Common environment overrides:
 
 ### Main results across model scales
 
-RLCSD attains the strongest average performance in every model block and wins
-most individual benchmarks across Qwen3 scales and Olmo-3-7B. The gains over the
-Base model average **+4.3** (math) and **+10.9** (logic) at 1.7B; **+2.5** /
-**+6.8** at 4B; **+2.7** / **+14.4** at 8B; and **+1.8** / **+9.9** on
-Olmo-3-7B. The advantage is especially pronounced on the OOD Knights & Knaves
-splits (**+21.0** on 11-role at 8B; **+13.0** on 11-role with Olmo-3-7B),
-suggesting the cleaned token-level signal improves generalization rather than
-just fitting the training task difficulty.
+We report two RLCSD variants: **Self-Roll.** uses the model's own verified
+successful rollout as the correct privileged context, while **GT CoT** uses the
+ground-truth reasoning trace from the dataset. Taking the better variant for
+each task family, the gains over the Base model are **+4.3 / +14.0**
+(math / logic) at 1.7B, **+2.9 / +6.8** at 4B, **+2.8 / +14.4** at 8B, and
+**+1.8 / +9.9** on Olmo-3-7B.
 
 | Model       | Method          | AMC23 | AIME24 | AIME25 | Math Avg.       | KK 4–8 | KK 9 | KK 10 | KK 11 | Logic Avg.      |
 |-------------|-----------------|------:|-------:|-------:|----------------:|-------:|-----:|------:|------:|----------------:|
@@ -198,31 +219,41 @@ just fitting the training task difficulty.
 |             | SDPO            | 72.9  | 42.2   | 33.6   | 49.6            | 67.4   | 61.0 | 54.0  | 30.0  | 53.1            |
 |             | SRPO            | 73.2  | 43.6   | 34.4   | 50.4            | 64.4   | 58.0 | 47.0  | 33.0  | 50.6            |
 |             | RLSD            | 73.9  | 46.1   | 36.9   | 52.3            | 66.8   | 59.0 | 50.0  | 35.0  | 52.7            |
-|             | **RLCSD (ours)**| **77.2** | **53.1** | **38.3** | **56.2** (+4.3) | **70.0** | **63.0** | **63.0** | **38.0** | **58.5** (+10.9) |
+|             | **RLCSD (Self-Roll.)** | 77.2 | 53.1 | **38.3** | **56.2** (+4.3) | 70.0 | 63.0 | 63.0 | 38.0 | 58.5 (+10.9) |
+|             | **RLCSD (GT CoT)** | **77.3** | **53.3** | 38.1 | **56.2** (+4.3) | **71.2** | **70.0** | **65.0** | **40.0** | **61.6** (+14.0) |
 | Qwen3-4B    | Base            | 88.6  | 72.5   | 65.3   | 75.5            | 73.2   | 67.0 | 58.0  | 42.0  | 60.1            |
 |             | GRPO            | 89.1  | **75.8** | 66.1   | 77.0            | 75.4   | 71.0 | 61.0  | 45.0  | 63.1            |
 |             | OPSD            | 89.4  | 74.2   | 67.5   | 77.0            | 73.4   | 71.0 | 62.0  | 42.0  | 62.1            |
 |             | SDPO            | 88.3  | 68.3   | 64.4   | 73.7            | 74.4   | 72.0 | 62.0  | 45.0  | 63.4            |
 |             | SRPO            | 87.9  | 71.4   | 64.7   | 74.7            | 75.0   | 71.0 | 61.0  | 45.0  | 63.0            |
 |             | RLSD            | 86.9  | 71.2   | 66.9   | 75.0            | 76.8   | 72.0 | 63.0  | 48.0  | 65.0            |
-|             | **RLCSD (ours)**| **90.1** | 74.4 | **69.4** | **78.0** (+2.5) | **78.6** | **73.0** | **66.0** | **50.0** | **66.9** (+6.8) |
+|             | **RLCSD (Self-Roll.)** | 90.1 | 74.4 | **69.4** | 78.0 (+2.5) | **78.6** | 73.0 | 66.0 | **50.0** | **66.9** (+6.8) |
+|             | **RLCSD (GT CoT)** | **90.4** | **75.8** | 68.9 | **78.4** (+2.9) | 77.2 | **75.0** | **67.0** | 48.0 | 66.8 (+6.7) |
 | Qwen3-8B    | Base            | 88.8  | 74.2   | 66.9   | 76.6            | 72.4   | 67.0 | 55.0  | 44.0  | 59.6            |
-|             | GRPO            | 90.1  | 76.1   | **69.7** | 78.6          | 76.8   | 75.0 | 63.0  | 49.0  | 66.0            |
+|             | GRPO            | 90.1  | 76.1   | 69.7 | 78.6          | 76.8   | 75.0 | 63.0  | 49.0  | 66.0            |
 |             | OPSD            | 90.4  | 76.9   | 68.7   | 78.7            | 75.2   | 74.0 | 61.0  | 49.0  | 64.8            |
 |             | SDPO            | 88.8  | 76.1   | 65.6   | 76.8            | 72.4   | 72.0 | 56.0  | 46.0  | 61.6            |
 |             | SRPO            | 88.3  | 75.3   | 65.6   | 76.4            | 74.8   | 72.0 | 60.0  | 49.0  | 64.0            |
 |             | RLSD            | 88.7  | 75.5   | 67.2   | 77.1            | 76.6   | 77.0 | 64.0  | 52.0  | 67.4            |
-|             | **RLCSD (ours)**| **90.8** | **77.5** | **69.7** | **79.3** (+2.7) | **81.8** | **79.0** | **70.0** | **65.0** | **74.0** (+14.4) |
+|             | **RLCSD (Self-Roll.)** | **90.8** | **77.5** | 69.7 | 79.3 (+2.7) | **81.8** | **79.0** | **70.0** | **65.0** | **74.0** (+14.4) |
+|             | **RLCSD (GT CoT)** | 90.7 | 76.7 | **70.8** | **79.4** (+2.8) | 80.2 | **79.0** | 69.0 | 60.0 | 72.1 (+12.5) |
 | Olmo-3-7B   | Base            | 91.2  | 73.9   | 66.9   | 77.3            | 70.6   | 64.0 | 55.0  | 35.0  | 56.2            |
 |             | GRPO            | 92.4  | 75.8   | **68.9** | 79.0          | 73.8   | 69.0 | 63.0  | 39.0  | 61.2            |
 |             | OPSD            | 92.2  | 75.6   | 66.9   | 78.2            | 72.4   | 69.0 | 62.0  | 38.0  | 60.4            |
 |             | SDPO            | 91.6  | 74.2   | 67.4   | 77.7            | 73.2   | 67.0 | 59.0  | 46.0  | 61.3            |
 |             | SRPO            | 92.1  | 75.0   | 65.3   | 77.5            | 73.2   | 68.0 | 61.0  | 40.0  | 60.6            |
 |             | RLSD            | 92.6  | 74.7   | 66.9   | 78.1            | 73.8   | 65.0 | 61.0  | 38.0  | 59.4            |
-|             | **RLCSD (ours)**| **92.7** | **76.1** | 68.6 | **79.1** (+1.8) | **75.4** | **76.0** | **65.0** | **48.0** | **66.1** (+9.9) |
+|             | **RLCSD (Self-Roll.)** | **92.7** | **76.1** | 68.6 | **79.1** (+1.8) | **75.4** | **76.0** | **65.0** | **48.0** | **66.1** (+9.9) |
+|             | **RLCSD (GT CoT)** | 92.5 | 73.9 | 67.3 | 77.9 (+0.6) | 70.6 | 65.0 | 61.0 | 37.0 | 58.4 (+2.2) |
 
 Math is reported as **mean@12**; Knights & Knaves as **pass@1**. KK 4–8 is the
-in-distribution test set; 9 / 10 / 11 are out-of-distribution role counts.
+in-distribution test set; 9 / 10 / 11 are out-of-distribution role counts. Bold
+numbers mark the best result in each model block.
+Self-rollout is the more stable overall choice and is clearly stronger on
+larger-model logical reasoning, particularly Olmo-3-7B. GT CoT nevertheless
+produces the best Qwen3-1.7B logic average (**61.6**), Qwen3-4B math average
+(**78.4**), and Qwen3-8B math average (**79.4**), showing that the preferred
+positive-hint source remains model- and dataset-dependent.
 
 ### Training stability
 
@@ -252,12 +283,17 @@ metric.
 Concretely, for each method we vary only the source of the privileged signal
 and hold everything else fixed:
 
-1. **Dataset CoT** — privileged context is the ground-truth solution from the
-   dataset (the original setting in each method's paper).
-2. **Own correct rollout** — privileged context is a correct rollout sampled
-   by the model itself from the same group.
-3. **Own rollout + contrast** — the contrastive construction (correct rollout
-   vs. incorrect sibling rollout). This is what `*_ectr` and `rlcsd` use.
+1. **GT CoT (one-sided)** — the positive context is the ground-truth solution
+   from the dataset, with no negative branch.
+2. **Self-Roll. (one-sided)** — the positive context is a correct rollout
+   sampled by the model itself, with no negative branch.
+3. **Self-Roll. (contrastive)** — a correct self-rollout is contrasted against
+   incorrect sibling rollouts. This is what `*_ectr` and RLCSD's default
+   `self_rollout` configuration use.
+
+These plug-in ablations are distinct from the new RLCSD **GT CoT** variant in
+the main results: that variant remains contrastive, using dataset GT CoT for
+the positive branch and incorrect self-rollouts for the negative branch.
 
 Settings (1) and (2) perform essentially the same across all three methods —
 switching the *source* of the one-sided hint barely matters. Setting (3) is
@@ -268,7 +304,7 @@ KK = 4–8 + 9 + 10 + 11 pass@1, Qwen3-4B):
 |  Method | Δ (Math avg) | Δ (KK avg) |
 |---------|-------------:|-----------:|
 | OPSD    | **+0.2**     | **+2.3**   |
-| RLSD    | **+2.2**     | **+1.0**   |
+| RLSD    | **+2.2**     | **+0.5**   |
 | RLCSD   | **+3.0**     | **+5.4**   |
 
 **`opsd_ectr` — OPSD + contrastive token-level signal.** Without contrast,

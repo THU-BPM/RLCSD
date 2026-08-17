@@ -67,6 +67,7 @@ OUTPUT_DIR=$(Y output_dir "")
 VAL_BEFORE=$(Y val_before_train false)
 USE_SWANLAB=$(Y use_swanlab true)
 PRIVILEGED_TEXT_MODE=$(Y privileged_text_mode solution_answer)
+CORRECT_PRIVILEGED_HINT_SOURCE=$(Y correct_privileged_hint_source self_rollout)
 # OPD (plain on-policy distillation) keys; only consumed when METHOD=opd.
 TEACHER_MODEL_PATH=$(Y teacher_model_path "")
 TEACHER_ENABLE_RESOURCE_POOL=$(Y teacher_enable_resource_pool false)
@@ -219,6 +220,9 @@ for arg in "$@"; do
         privileged_text_mode=*|+privileged_text_mode=*)
             PRIVILEGED_TEXT_MODE="${arg#*=}"
             ;;
+        correct_privileged_hint_source=*|+correct_privileged_hint_source=*)
+            CORRECT_PRIVILEGED_HINT_SOURCE="${arg#*=}"
+            ;;
         val_enable_thinking=*|+val_enable_thinking=*)
             VAL_ENABLE_THINKING="${arg#*=}"
             ;;
@@ -280,6 +284,26 @@ normalize_privileged_text_mode() {
     printf '%s' "$mode"
 }
 
+normalize_correct_privileged_hint_source() {
+    local source="$1"
+    source="$(echo "$source" | tr '[:upper:]' '[:lower:]' | tr -- '- ' '__')"
+    case "$source" in
+        self|rollout)
+            source="self_rollout"
+            ;;
+        dataset|dataset_cot|ground_truth_cot|gt)
+            source="gt_cot"
+            ;;
+        self_rollout|gt_cot)
+            ;;
+        *)
+            echo "Invalid correct_privileged_hint_source '${1}'. Allowed values: self_rollout, gt_cot" >&2
+            return 1
+            ;;
+    esac
+    printf '%s' "$source"
+}
+
 ensure_dataset_parquet() {
     local split="$1"
     local dataset_name="$2"
@@ -305,6 +329,7 @@ if [ -z "$VAL_FILES" ] || [ "$VAL_FILES" = "None" ]; then
 fi
 
 PRIVILEGED_TEXT_MODE="$(normalize_privileged_text_mode "$PRIVILEGED_TEXT_MODE")"
+CORRECT_PRIVILEGED_HINT_SOURCE="$(normalize_correct_privileged_hint_source "$CORRECT_PRIVILEGED_HINT_SOURCE")"
 
 resolve_abs_path() {
     python3 - "$1" <<'PY'
@@ -442,6 +467,11 @@ if [ "$METHOD" != "grpo" ] && [ "$METHOD" != "opd" ]; then
     ALGO="$ALGO +actor_rollout_ref.rollout.custom.teacher_enable_thinking=${TEACHER_ENABLE_THINKING}"
     ALGO="$ALGO +actor_rollout_ref.rollout.custom.thinking_system_prompt=${THINKING_SYSTEM_PROMPT}"
 fi
+case "$METHOD" in
+    rlcsd|opsd_ectr|rlsd_ectr)
+        ALGO="$ALGO +actor_rollout_ref.rollout.custom.correct_privileged_hint_source=${CORRECT_PRIVILEGED_HINT_SOURCE}"
+        ;;
+esac
 
 # --- OPD-specific distillation overrides ---
 DISTILL_ARGS=()

@@ -3,7 +3,7 @@ Entry point for self-distillation training using verl's infrastructure.
 
 Self-distillation flow per rollout step:
 1. Student rollout: vLLM generates responses (verl standard)
-2. Privileged text extraction: read GT solution/answer from the dataset batch
+2. Privileged text construction: use dataset GT or verified sibling rollouts
 3. Teacher forward: compute log probs with privileged context on the same response tokens
 4. Actor update with distillation loss
 
@@ -42,6 +42,7 @@ RLCSD_LOSS_MODES = {"rlcsd","rlsd_ectr", "opsd_ectr"}
 # 4 covers the typical group_size=8 case (3-7 non-self negatives) without
 # ballooning per-rollout teacher-forward cost.
 RLCSD_DEFAULT_K_MAX = 4
+CORRECT_PRIVILEGED_HINT_SOURCES = {"self_rollout", "gt_cot"}
 DISTILL_LOSS_MODES = {"opsd", "sdpo", "rlsd", "srpo", *RLCSD_LOSS_MODES}
 MATH_DATA_SOURCES = {
     "dapo_math_17k",
@@ -136,6 +137,25 @@ def _custom_cfg_bool(self, key, default=False):
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
+
+
+def _normalize_correct_privileged_hint_source(source):
+    normalized = str(source or "self_rollout").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "self": "self_rollout",
+        "rollout": "self_rollout",
+        "dataset": "gt_cot",
+        "dataset_cot": "gt_cot",
+        "ground_truth_cot": "gt_cot",
+        "gt": "gt_cot",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in CORRECT_PRIVILEGED_HINT_SOURCES:
+        raise ValueError(
+            f"Unsupported correct_privileged_hint_source={source!r}. "
+            f"Supported values: {sorted(CORRECT_PRIVILEGED_HINT_SOURCES)}."
+        )
+    return normalized
 
 
 def _teacher_total_token_budget(self) -> int:
@@ -312,11 +332,24 @@ def _materialize_teacher_context(self, problem, answer, solution):
         "answer": answer}
 
 
-def _sample_other_rollout(indices, current_idx):
-    candidate_indices = [idx for idx in indices if idx != current_idx]
-    if not candidate_indices:
-        return None
-    return random.choice(candidate_indices)
+def _hint_candidate_indices(
+    current_idx,
+    target_is_correct,
+    correct_hint_source,
+    valid_positive_indices,
+    valid_negative_indices,
+):
+    """Return source-specific correct candidates and non-self wrong candidates."""
+    if correct_hint_source == "gt_cot":
+        correct_candidates = None
+    else:
+        correct_candidates = [candidate for candidate in valid_positive_indices if candidate != current_idx]
+
+    if target_is_correct:
+        wrong_candidates = list(valid_negative_indices)
+    else:
+        wrong_candidates = [candidate for candidate in valid_negative_indices if candidate != current_idx]
+    return correct_candidates, wrong_candidates
 
 
 def _expand_to_rollout(values, batch_size, rollout_n):
@@ -529,7 +562,7 @@ def _build_teacher_multi_batch_from_prompt_groups(self, teacher_prompt_groups, r
 
 
 def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
-    """Build positive/negative teacher prompts from rollout groups identified by uid."""
+    """Build correct/wrong teacher prompts from rollout groups identified by uid."""
     self._data_metric_overrides = _compute_prefilter_metric_overrides(self, batch)
     loss_mode = _cfg_get(self, "loss_mode", "vanilla")
     if loss_mode not in RLCSD_LOSS_MODES:
@@ -545,7 +578,21 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
     if uid_values is None:
         raise ValueError("rlcsd_* requires uid in non_tensor_batch to recover rollout groups.")
 
-    problems, ground_truths, _ = self._extract_problems_answers_solutions(batch)
+    problems, ground_truths, solutions = self._extract_problems_answers_solutions(batch)
+    correct_hint_source = _normalize_correct_privileged_hint_source(
+        _custom_cfg_get(self, "correct_privileged_hint_source", "self_rollout")
+    )
+    if correct_hint_source == "gt_cot":
+        missing_indices = [idx for idx, solution in enumerate(solutions) if not solution]
+        if missing_indices:
+            preview = ", ".join(str(idx) for idx in missing_indices[:8])
+            if len(missing_indices) > 8:
+                preview = f"{preview}, ..."
+            raise ValueError(
+                "correct_privileged_hint_source=gt_cot requires every sample to have a non-empty "
+                f"dataset solution, but {len(missing_indices)}/{len(solutions)} samples are missing it "
+                f"(batch indices: {preview})."
+            )
     responses = batch.batch["responses"]
     responses_text = self.tokenizer.batch_decode(responses, skip_special_tokens=True)
     reward_tensor = batch.batch["token_level_scores"] if "token_level_scores" in batch.batch.keys() else batch.batch["rm_scores"]
@@ -582,19 +629,32 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
         positives = [idx for idx in group_indices if rewards[idx] > 0]
         negatives = [idx for idx in group_indices if rewards[idx] <= 0]
         if not positives or not negatives:
-            num_aborted += 1
             all_same_outcome_group_count += 1
+
+        # A wrong branch is always required. The self-rollout correct source also
+        # requires a verified positive sibling; GT CoT does not.
+        if not negatives or (correct_hint_source == "self_rollout" and not positives):
+            num_aborted += 1
             continue
 
         problem = problems[group_indices[0]]
         positive_contexts = {}
-        for idx in positives:
-            correct_answer = extract_boxed_answer(responses_text[idx]) or ground_truths[idx]
-            positive_contexts[idx] = _materialize_teacher_context(
+        gt_correct_context = None
+        if correct_hint_source == "gt_cot":
+            gt_idx = group_indices[0]
+            gt_correct_context = _materialize_teacher_context(
                 self,
                 problem=problem,
-                answer=correct_answer,
-                solution=responses_text[idx])
+                answer=ground_truths[gt_idx],
+                solution=solutions[gt_idx])
+        else:
+            for idx in positives:
+                correct_answer = extract_boxed_answer(responses_text[idx]) or ground_truths[idx]
+                positive_contexts[idx] = _materialize_teacher_context(
+                    self,
+                    problem=problem,
+                    answer=correct_answer,
+                    solution=responses_text[idx])
 
         negative_contexts = {}
         for idx in negatives:
@@ -609,33 +669,40 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
 
         valid_positive_indices = list(positive_contexts)
         valid_negative_indices = list(negative_contexts)
-        if not valid_positive_indices or not valid_negative_indices:
+        if not valid_negative_indices or (
+            correct_hint_source == "self_rollout" and not valid_positive_indices
+        ):
             num_aborted += 1
             continue
 
         group_valid_count = 0
         for idx in group_indices:
-            if idx in positive_contexts:
-                positive_idx = _sample_other_rollout(valid_positive_indices, idx)
-                if positive_idx is None:
-                    self_excluded_sampling_skip_count += 1
-                    continue
-                correct_context = positive_contexts[positive_idx]
-                wrong_idx = random.choice(valid_negative_indices)
-                wrong_context = negative_contexts[wrong_idx]
-                rlcsd_wrong_pool = list(valid_negative_indices)
+            target_is_correct = rewards[idx] > 0
+            correct_pool, rlcsd_wrong_pool = _hint_candidate_indices(
+                current_idx=idx,
+                target_is_correct=target_is_correct,
+                correct_hint_source=correct_hint_source,
+                valid_positive_indices=valid_positive_indices,
+                valid_negative_indices=valid_negative_indices,
+            )
+
+            if correct_hint_source == "gt_cot":
+                correct_context = gt_correct_context
+                correct_pool_size = 1
             else:
-                negative_idx = _sample_other_rollout(valid_negative_indices, idx)
-                if negative_idx is None:
+                if not correct_pool:
                     self_excluded_sampling_skip_count += 1
                     continue
-                wrong_context = negative_contexts.get(negative_idx)
-                if wrong_context is None:
-                    self_negative_missing_boxed_count += 1
-                    continue
-                wrong_idx = negative_idx
-                correct_context = positive_contexts[random.choice(valid_positive_indices)]
-                rlcsd_wrong_pool = [c for c in valid_negative_indices if c != idx]
+                correct_context = positive_contexts[random.choice(correct_pool)]
+                correct_pool_size = len(correct_pool)
+
+            # A correct target can use any wrong rollout. An incorrect target
+            # must exclude itself to avoid self-conditioning over-confidence.
+            if not rlcsd_wrong_pool:
+                self_excluded_sampling_skip_count += 1
+                continue
+            wrong_idx = random.choice(rlcsd_wrong_pool)
+            wrong_context = negative_contexts[wrong_idx]
 
             valid_mask[idx] = True
             correct_prompt_by_idx[idx] = correct_context["prompt"]
@@ -644,6 +711,7 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
             wrong_text_by_idx[idx] = wrong_context["text"]
             correct_answer_by_idx[idx] = correct_context["answer"]
             wrong_answer_by_idx[idx] = wrong_context["answer"]
+            correct_pool_sizes.append(correct_pool_size)
             if loss_mode == "rlcsd":
                 # K = min(rlcsd_k_max, |non-self negatives|). Always include the
                 # chosen single-pair wrong sibling first so the marginal mean
@@ -743,7 +811,8 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
         "privileged_text_groups_wrong": privileged_text_groups_wrong,
         "correct_answer_groups": correct_answer_groups,
         "wrong_answer_groups": wrong_answer_groups,
-        "effective_modes": ["solution_answer"] * len(teacher_correct_prompts)}
+        "effective_modes": ["solution_answer"] * len(teacher_correct_prompts),
+        "correct_privileged_hint_sources": [correct_hint_source] * len(teacher_correct_prompts)}
     self._rlcsd_step_metrics = step_metrics
 
     if loss_mode == "rlcsd":
@@ -899,6 +968,7 @@ def _save_train_rollout(self, batch: DataProto):
     privileged_texts = aligned_context.get("privileged_texts", []) if aligned_context is not None else []
     teacher_prompts = aligned_context.get("teacher_prompts", []) if aligned_context is not None else []
     effective_modes = aligned_context.get("effective_modes", []) if aligned_context is not None else []
+    correct_hint_sources = aligned_context.get("correct_privileged_hint_sources", []) if aligned_context is not None else []
     privileged_texts_correct = aligned_context.get("privileged_texts_correct", []) if aligned_context is not None else []
     privileged_texts_wrong = aligned_context.get("privileged_texts_wrong", []) if aligned_context is not None else []
     teacher_correct_prompts = aligned_context.get("teacher_correct_prompts", []) if aligned_context is not None else []
@@ -927,6 +997,8 @@ def _save_train_rollout(self, batch: DataProto):
             entry["teacher_prompt"] = teacher_prompts[i]
         if i < len(effective_modes):
             entry["privileged_text_mode"] = effective_modes[i]
+        if i < len(correct_hint_sources):
+            entry["correct_privileged_hint_source"] = correct_hint_sources[i]
         if i < len(privileged_texts_correct):
             entry["privileged_text_correct"] = privileged_texts_correct[i]
         if i < len(privileged_texts_wrong):

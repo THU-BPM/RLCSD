@@ -310,7 +310,8 @@ class DataParallelPPOActor(BasePPOActor):
                                 batch_size=batch_size,
                                 seqlen=seqlen,
                                 response_length=response_length,
-                                response_mask=response_mask if align_response_by_mask else None)
+                                response_mask=response_mask if align_response_by_mask else None,
+                                attention_mask=attention_mask if align_response_by_mask else None)
                             topk_indices_rmpad = index_first_axis(
                                 rearrange(full_topk_indices, "b s k -> (b s) k"),
                                 indices)
@@ -430,27 +431,45 @@ class DataParallelPPOActor(BasePPOActor):
                 if align_response_by_mask:
                     response_lengths = response_mask.sum(dim=1).to(dtype=torch.long)
                     log_probs = self._align_compact_response_tensor(
-                        full_log_probs.squeeze(-1), response_length=response_length, response_lengths=response_lengths
+                        full_log_probs.squeeze(-1),
+                        response_length=response_length,
+                        response_lengths=response_lengths,
+                        attention_mask=attention_mask,
                     )
                     if calculate_entropy:
                         entropy = self._align_compact_response_tensor(
-                            full_entropy.squeeze(-1), response_length=response_length, response_lengths=response_lengths
+                            full_entropy.squeeze(-1),
+                            response_length=response_length,
+                            response_lengths=response_lengths,
+                            attention_mask=attention_mask,
                         )
                     if calculate_sum_pi_squared:
                         sum_pi_squared = self._align_compact_response_tensor(
-                            full_sum_pi_squared.squeeze(-1), response_length=response_length, response_lengths=response_lengths
+                            full_sum_pi_squared.squeeze(-1),
+                            response_length=response_length,
+                            response_lengths=response_lengths,
+                            attention_mask=attention_mask,
                         )
                     if return_all_logps:
                         all_log_probs = self._align_compact_response_tensor(
-                            full_all_log_probs, response_length=response_length, response_lengths=response_lengths
+                            full_all_log_probs,
+                            response_length=response_length,
+                            response_lengths=response_lengths,
+                            attention_mask=attention_mask,
                         )
                     if use_topk:
                         topk_log_probs = self._align_compact_response_tensor(
-                            full_topk_log_probs, response_length=response_length, response_lengths=response_lengths
+                            full_topk_log_probs,
+                            response_length=response_length,
+                            response_lengths=response_lengths,
+                            attention_mask=attention_mask,
                         )
                         if return_topk_indices:
                             topk_indices = self._align_compact_response_tensor(
-                                full_topk_indices, response_length=response_length, response_lengths=response_lengths
+                                full_topk_indices,
+                                response_length=response_length,
+                                response_lengths=response_lengths,
+                                attention_mask=attention_mask,
                             )
                 else:
                     if calculate_entropy:
@@ -483,14 +502,38 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.use_fused_kernels:
                     if return_all_logps or use_topk:
                         raise ValueError("full_logit_distill/top-k distillation is not supported with fused kernels enabled.")
-                    log_probs = output.log_probs[:, -response_length - 1 : -1]
-                    entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
+                    if align_response_by_mask:
+                        response_lengths = response_mask.sum(dim=1).to(dtype=torch.long)
+                        log_probs = self._align_compact_response_tensor(
+                            output.log_probs,
+                            response_length=response_length,
+                            response_lengths=response_lengths,
+                            attention_mask=attention_mask,
+                        )
+                        entropy = self._align_compact_response_tensor(
+                            output.entropy,
+                            response_length=response_length,
+                            response_lengths=response_lengths,
+                            attention_mask=attention_mask,
+                        )
+                    else:
+                        log_probs = output.log_probs[:, -response_length - 1 : -1]
+                        entropy = output.entropy[:, -response_length - 1 : -1]  # (bsz, response_length)
 
                 else:
                     logits = output.logits
 
                     logits.div_(temperature)
-                    logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
+                    if align_response_by_mask:
+                        response_lengths = response_mask.sum(dim=1).to(dtype=torch.long)
+                        logits = self._align_compact_response_tensor(
+                            logits,
+                            response_length=response_length,
+                            response_lengths=response_lengths,
+                            attention_mask=attention_mask,
+                        )
+                    else:
+                        logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     if return_all_logps:
                         all_log_probs = F.log_softmax(logits, dim=-1)
                     if use_topk:
@@ -535,7 +578,8 @@ class DataParallelPPOActor(BasePPOActor):
         batch_size: int,
         seqlen: int,
         response_length: int,
-        response_mask: torch.Tensor | None) -> torch.Tensor:
+        response_mask: torch.Tensor | None,
+        attention_mask: torch.Tensor | None = None) -> torch.Tensor:
         """Expand response-space top-k indices into full-sequence positions."""
         topk = topk_indices.size(-1)
         full_topk_indices = torch.zeros(
@@ -544,36 +588,59 @@ class DataParallelPPOActor(BasePPOActor):
             topk,
             device=topk_indices.device,
             dtype=topk_indices.dtype)
-        if response_mask is None or seqlen >= response_length + 1:
+        if response_mask is None:
             full_topk_indices[:, -response_length - 1 : -1, :] = topk_indices
             return full_topk_indices
 
+        assert attention_mask is not None, "attention_mask is required to align compact response tensors."
         response_lengths = response_mask.sum(dim=1).to(dtype=torch.long)
-        max_response_tokens = int(response_lengths.max().item())
-        response_start = seqlen - max_response_tokens
-        predictor_start = max(response_start - 1, 0)
-        for row_idx, row_len in enumerate(response_lengths.tolist()):
+        predictor_starts = self._response_predictor_starts(attention_mask, response_lengths)
+        for row_idx, (row_len, predictor_start) in enumerate(
+            zip(response_lengths.tolist(), predictor_starts.tolist(), strict=True)
+        ):
             if row_len <= 0:
                 continue
-            full_topk_indices[row_idx, predictor_start : predictor_start + row_len, :] = topk_indices[row_idx, :row_len, :]
+            full_topk_indices[row_idx, predictor_start : predictor_start + row_len, :] = topk_indices[
+                row_idx, :row_len, :
+            ]
         return full_topk_indices
+
+    def _response_predictor_starts(
+        self,
+        attention_mask: torch.Tensor,
+        response_lengths: torch.Tensor) -> torch.Tensor:
+        """Locate each row's first response predictor from its actual attended span."""
+        sequence_positions = torch.arange(attention_mask.shape[1], device=attention_mask.device)
+        last_attended = torch.where(
+            attention_mask.to(dtype=torch.bool),
+            sequence_positions.unsqueeze(0),
+            sequence_positions.new_full((1,), -1),
+        ).amax(dim=1)
+        predictor_starts = last_attended - response_lengths
+        nonempty_rows = response_lengths > 0
+        assert torch.all(predictor_starts[nonempty_rows] >= 0), (
+            "Teacher inputs must contain at least one attended prompt token before every non-empty response."
+        )
+        return predictor_starts
 
     def _align_compact_response_tensor(
         self,
         tensor: torch.Tensor,
         response_length: int,
-        response_lengths: torch.Tensor) -> torch.Tensor:
+        response_lengths: torch.Tensor,
+        attention_mask: torch.Tensor) -> torch.Tensor:
         """Map compact teacher-response tensors back to fixed student response length."""
-        max_response_tokens = int(response_lengths.max().item())
-        response_start = tensor.shape[1] - max_response_tokens
-        predictor_start = max(response_start - 1, 0)
-        response_window = tensor[:, predictor_start : predictor_start + max_response_tokens, ...]
+        predictor_starts = self._response_predictor_starts(attention_mask, response_lengths)
         aligned_shape = (tensor.shape[0], response_length, *tensor.shape[2:])
         aligned = tensor.new_zeros(aligned_shape)
-        for row_idx, row_len in enumerate(response_lengths.tolist()):
+        for row_idx, (row_len, predictor_start) in enumerate(
+            zip(response_lengths.tolist(), predictor_starts.tolist(), strict=True)
+        ):
             if row_len <= 0:
                 continue
-            aligned[row_idx, :row_len, ...] = response_window[row_idx, :row_len, ...]
+            aligned[row_idx, :row_len, ...] = tensor[
+                row_idx, predictor_start : predictor_start + row_len, ...
+            ]
         return aligned
 
     def _chunked_rowwise_topk(self, logits: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:

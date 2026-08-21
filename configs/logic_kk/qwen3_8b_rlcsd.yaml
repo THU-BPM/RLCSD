@@ -2,7 +2,7 @@ method: rlcsd
 model_path: Qwen/Qwen3-8B
 use_lora: false
 
-learning_rate: 5e-6
+learning_rate: 1e-6
 num_epochs: 30
 per_device_batch_size: 8
 group_size: 8

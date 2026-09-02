@@ -8,10 +8,10 @@
 
 ## News
 
-- **2026-08-29 — Important notice: We have identified several implementation
+- <font style="color:red">2026-08-29 — Important notice: We have identified several implementation
   bugs and are actively fixing them and rerunning all affected experiments. We
   expect to complete this work within one month. Please do not use the current
-  repository for experiments until this notice is updated.**
+  repository for experiments until this notice is updated.</font>
 - **2026-08-17** — Added `correct_privileged_hint_source=gt_cot`, which uses
   the dataset-provided ground-truth reasoning trace as RLCSD's correct
   privileged hint. The [main results](#main-results-across-model-scales) now

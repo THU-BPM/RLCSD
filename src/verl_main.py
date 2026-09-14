@@ -104,7 +104,6 @@ class VerlConfig:
     rollout_is: str = ""
     rollout_is_threshold: str = "2.0"
     rollout_is_batch_normalize: bool = False
-    lam_decay_steps: int = 50
     teacher_sync_interval: int = 10
 
     logging_steps: int = 5

@@ -15,6 +15,7 @@ import os
 import sys
 import json
 import random
+import logging
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -36,13 +37,16 @@ from verl.protocol import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.metric_utils import compute_data_metrics
 
-RLCSD_LOSS_MODES = {"rlcsd","rlsd_ectr", "opsd_ectr"}
+logger = logging.getLogger(__name__)
+
+RLCSD_LOSS_MODES = {"rlcsd", "rlsd_ectr", "opsd_ectr"}
 
 # rlcsd_5 averages teacher_wrong_lp over up to K non-self negative siblings.
 # 4 covers the typical group_size=8 case (3-7 non-self negatives) without
 # ballooning per-rollout teacher-forward cost.
 RLCSD_DEFAULT_K_MAX = 4
 CORRECT_PRIVILEGED_HINT_SOURCES = {"self_rollout", "gt_cot"}
+PRIVILEGED_TEXT_SOURCES = {"self_rollout", "gt_cot"}
 DISTILL_LOSS_MODES = {"opsd", "sdpo", "rlsd", "srpo", *RLCSD_LOSS_MODES}
 MATH_DATA_SOURCES = {
     "dapo_math_17k",
@@ -140,7 +144,7 @@ def _custom_cfg_bool(self, key, default=False):
 
 
 def _normalize_correct_privileged_hint_source(source):
-    normalized = str(source or "self_rollout").strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = str(source or "gt_cot").strip().lower().replace("-", "_").replace(" ", "_")
     aliases = {
         "self": "self_rollout",
         "rollout": "self_rollout",
@@ -154,6 +158,25 @@ def _normalize_correct_privileged_hint_source(source):
         raise ValueError(
             f"Unsupported correct_privileged_hint_source={source!r}. "
             f"Supported values: {sorted(CORRECT_PRIVILEGED_HINT_SOURCES)}."
+        )
+    return normalized
+
+
+def _normalize_privileged_text_source(source):
+    normalized = str(source or "gt_cot").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "self": "self_rollout",
+        "rollout": "self_rollout",
+        "dataset": "gt_cot",
+        "dataset_cot": "gt_cot",
+        "ground_truth_cot": "gt_cot",
+        "gt": "gt_cot",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in PRIVILEGED_TEXT_SOURCES:
+        raise ValueError(
+            f"Unsupported privileged_text_source={source!r}. "
+            f"Supported values: {sorted(PRIVILEGED_TEXT_SOURCES)}."
         )
     return normalized
 
@@ -198,16 +221,20 @@ def _get_actor_dp_size(self) -> int:
 
 
 def _prepare_actor_update_batch(self, batch: DataProto) -> DataProto:
-    """Pad rlcsd actor batches to DP divisibility with zero-loss replicas."""
-    if _cfg_get(self, "loss_mode", "vanilla") not in RLCSD_LOSS_MODES:
+    """Pad filtered self-distillation batches with zero-loss replicas."""
+    loss_mode = _cfg_get(self, "loss_mode", "vanilla")
+    self_rollout_filtered = bool(batch.meta_info.get("self_rollout_distill_filtered", False))
+    if loss_mode not in RLCSD_LOSS_MODES and not self_rollout_filtered:
         return batch
+
+    metric_prefix = "self_rollout_distill" if self_rollout_filtered else "rlcsd"
 
     batch_size = len(batch)
     actor_dp_size = _get_actor_dp_size(self)
     if batch_size == 0 or actor_dp_size <= 1 or batch_size % actor_dp_size == 0:
         metrics = getattr(self, "_rlcsd_step_metrics", {})
-        metrics["rlcsd/actor_pad_count"] = 0.0
-        metrics["rlcsd/actor_padded_batch_size"] = float(batch_size)
+        metrics[f"{metric_prefix}/actor_pad_count"] = 0.0
+        metrics[f"{metric_prefix}/actor_padded_batch_size"] = float(batch_size)
         self._rlcsd_step_metrics = metrics
         return batch
 
@@ -220,11 +247,11 @@ def _prepare_actor_update_batch(self, batch: DataProto) -> DataProto:
         padded_tail.batch["response_mask"] = torch.zeros_like(padded_tail.batch["response_mask"])
     if "uid" in padded_tail.non_tensor_batch:
         padded_tail.non_tensor_batch["uid"] = np.asarray(
-            [f"__rlcsd_pad__{i}" for i in range(pad_size)],
+            [f"__self_distill_pad__{i}" for i in range(pad_size)],
             dtype=object)
     metrics = getattr(self, "_rlcsd_step_metrics", {})
-    metrics["rlcsd/actor_pad_count"] = float(pad_size)
-    metrics["rlcsd/actor_padded_batch_size"] = float(batch_size + pad_size)
+    metrics[f"{metric_prefix}/actor_pad_count"] = float(pad_size)
+    metrics[f"{metric_prefix}/actor_padded_batch_size"] = float(batch_size + pad_size)
     self._rlcsd_step_metrics = metrics
     actor_batch = DataProto.concat([batch, padded_tail])
     actor_batch.meta_info = dict(batch.meta_info)
@@ -301,7 +328,7 @@ def _build_teacher_prompt(problem, answer, solution, mode, transition_prompt=Non
 
 
 def _materialize_teacher_context(self, problem, answer, solution):
-    """Build a teacher context for the rlcsd_* methods.
+    """Build a privileged teacher context for contrastive methods.
 
     rlcsd_* uses the lighter RLCSD_TEACHER_TRANSITION_PROMPT (does not ask
     the model to derive a separate answer). opsd/sdpo/rlsd/srpo continue
@@ -412,11 +439,18 @@ def _build_teacher_context_payloads(self, problems, ground_truths, solutions):
 
 
 def _generate_rationales(self, batch: DataProto, gen_output: DataProto) -> dict | None:
-    """Cache GT privileged text from the dataset batch for teacher forwarding."""
+    """Cache dataset privileged text when the configured source is GT CoT."""
     loss_mode = _cfg_get(self, "loss_mode", "vanilla")
     if loss_mode not in DISTILL_LOSS_MODES:
         return None
     if loss_mode in RLCSD_LOSS_MODES:
+        return None
+    privileged_text_source = _normalize_privileged_text_source(
+        _custom_cfg_get(self, "privileged_text_source", "gt_cot")
+    )
+    if privileged_text_source == "self_rollout":
+        # Rewards and uid-aligned sibling groups become available later in the
+        # trainer step, after reward extraction and advantage computation.
         return None
 
     raw_prompts = batch.non_tensor_batch.get("raw_prompt")
@@ -465,8 +499,13 @@ def _build_teacher_batch_from_prompts(self, teacher_prompts, responses, prefix="
         teacher_prompt_lens.append(len(prompt_ids))
 
     max_prompt_len = max(teacher_prompt_lens)
-    response_len = max(len(ids) - teacher_prompt_lens[i] for i, ids in enumerate(teacher_input_ids_list))
-    total_len = max_prompt_len + response_len
+    # Keep the response block at the same fixed width as the rollout tensor.
+    # Teacher responses are compacted above by removing right padding, but the
+    # actor aligns teacher logits using responses.shape[-1]. Shrinking this
+    # block to the longest response in the current batch makes that alignment
+    # point into (or before) the prompt whenever every response is short.
+    response_width = int(responses.shape[1])
+    total_len = max_prompt_len + response_width
 
     teacher_input_ids = torch.full((batch_size, total_len), pad_id, dtype=torch.long)
     teacher_attention_mask = torch.zeros((batch_size, total_len), dtype=torch.long)
@@ -579,8 +618,10 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
         raise ValueError("rlcsd_* requires uid in non_tensor_batch to recover rollout groups.")
 
     problems, ground_truths, solutions = self._extract_problems_answers_solutions(batch)
+    # Use ground-truth positive evidence by default; self-rollout remains opt-in.
+    default_correct_hint_source = "gt_cot"
     correct_hint_source = _normalize_correct_privileged_hint_source(
-        _custom_cfg_get(self, "correct_privileged_hint_source", "self_rollout")
+        _custom_cfg_get(self, "correct_privileged_hint_source", default_correct_hint_source)
     )
     if correct_hint_source == "gt_cot":
         missing_indices = [idx for idx, solution in enumerate(solutions) if not solution]
@@ -601,9 +642,21 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
     else:
         rewards = reward_tensor.detach().cpu().tolist()
 
+    # A teacher context must retain at least one prompt token before the
+    # response. Drop targets that cannot fit within the teacher token budget;
+    # they may still provide truncated reference solutions to other targets.
+    teacher_budget = _teacher_total_token_budget(self)
+    pad_id = self.tokenizer.pad_token_id or 0
+    response_token_counts = (responses != pad_id).sum(dim=1).detach().cpu().tolist()
+    teacher_overlong = [int(count) >= teacher_budget for count in response_token_counts]
+    teacher_overlong_skip_count = int(sum(teacher_overlong))
+
     groups = {}
     for idx, uid in enumerate(uid_values.tolist()):
         groups.setdefault(str(uid), []).append(idx)
+
+    def is_verified_success(idx):
+        return rewards[idx] > 0
 
     num_aborted = 0
     all_same_outcome_group_count = 0
@@ -626,8 +679,8 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
     wrong_pool_sizes = []
     valid_group_count = 0
     for group_indices in groups.values():
-        positives = [idx for idx in group_indices if rewards[idx] > 0]
-        negatives = [idx for idx in group_indices if rewards[idx] <= 0]
+        positives = [idx for idx in group_indices if is_verified_success(idx)]
+        negatives = [idx for idx in group_indices if not is_verified_success(idx)]
         if not positives or not negatives:
             all_same_outcome_group_count += 1
 
@@ -660,6 +713,7 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
         for idx in negatives:
             wrong_answer = extract_boxed_answer(responses_text[idx])
             if wrong_answer is None:
+                self_negative_missing_boxed_count += 1
                 continue
             negative_contexts[idx] = _materialize_teacher_context(
                 self,
@@ -677,7 +731,13 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
 
         group_valid_count = 0
         for idx in group_indices:
-            target_is_correct = rewards[idx] > 0
+            if teacher_overlong[idx]:
+                # This rollout cannot be paired with a teacher context within
+                # the configured budget while preserving response alignment.
+                # Keep it out of the target batch instead of crashing the whole
+                # RL step in _response_predictor_start.
+                continue
+            target_is_correct = is_verified_success(idx)
             correct_pool, rlcsd_wrong_pool = _hint_candidate_indices(
                 current_idx=idx,
                 target_is_correct=target_is_correct,
@@ -743,6 +803,7 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
         "rlcsd/all_same_outcome_group_count": float(all_same_outcome_group_count),
         "rlcsd/self_negative_missing_boxed_count": float(self_negative_missing_boxed_count),
         "rlcsd/self_excluded_sampling_skip_count": float(self_excluded_sampling_skip_count),
+        "rlcsd/teacher_response_overlong_skip_count": float(teacher_overlong_skip_count),
         "rlcsd/skipped_sample_count": float(batch_size - valid_sample_count),
         "rlcsd/actor_pad_count": 0.0,
         "rlcsd/actor_padded_batch_size": float(valid_sample_count),
@@ -841,18 +902,212 @@ def _compute_rlcsd_teacher_inputs(self, batch: DataProto) -> DataProto | None:
         return teacher_correct.union(teacher_wrong)
 
 
+def _compute_self_rollout_teacher_inputs(self, batch: DataProto) -> DataProto | None:
+    """Build single-context baseline teachers from verified successful siblings.
+
+    OPSD, SDPO, SRPO, and RLSD can replace the offline GT solution with a
+    positive-score rollout from the same uid group, excluding the target itself.
+    SRPO keeps targets without such a sibling and explicitly routes them back to
+    GRPO; the other distillation baselines retain their filtered behavior.
+    """
+    loss_mode = _cfg_get(self, "loss_mode", "vanilla")
+    self._data_metric_overrides = _compute_prefilter_metric_overrides(self, batch)
+    batch_size = batch.batch.batch_size[0]
+    if batch_size == 0:
+        batch.meta_info["skip_actor_update"] = True
+        self._aligned_teacher_rollout_details = {}
+        self._rlcsd_step_metrics = {"self_rollout_distill/skip_actor_update": 1.0}
+        return None
+
+    uid_values = batch.non_tensor_batch.get("uid")
+    if uid_values is None:
+        raise ValueError("privileged_text_source=self_rollout requires uid rollout groups.")
+
+    problems, _, _ = self._extract_problems_answers_solutions(batch)
+    responses = batch.batch["responses"]
+    responses_text = self.tokenizer.batch_decode(responses, skip_special_tokens=True)
+    reward_tensor = (
+        batch.batch["token_level_scores"]
+        if "token_level_scores" in batch.batch.keys()
+        else batch.batch["rm_scores"]
+    )
+    if reward_tensor.dim() > 1:
+        rewards = reward_tensor.sum(dim=-1).detach().cpu().tolist()
+    else:
+        rewards = reward_tensor.detach().cpu().tolist()
+
+    groups = {}
+    for idx, uid in enumerate(uid_values.tolist()):
+        groups.setdefault(str(uid), []).append(idx)
+
+    def is_verified_success(idx):
+        return rewards[idx] > 0
+
+    valid_mask = np.zeros(batch_size, dtype=bool)
+    prompt_by_idx = {}
+    text_by_idx = {}
+    source_idx_by_idx = {}
+    sibling_pool_sizes = []
+    valid_group_count = 0
+    groups_without_success = 0
+    groups_without_nonself_success = 0
+
+    for group_indices in groups.values():
+        positive_indices = [idx for idx in group_indices if is_verified_success(idx)]
+        if not positive_indices:
+            groups_without_success += 1
+            continue
+
+        contexts = {}
+        for positive_idx in positive_indices:
+            payload = _build_teacher_context_payloads(
+                self,
+                problems=[problems[positive_idx]],
+                ground_truths=["successful rollout"],
+                solutions=[responses_text[positive_idx]],
+            )
+            contexts[positive_idx] = {
+                "prompt": payload["teacher_prompts"][0],
+                "text": payload["privileged_texts"][0],
+            }
+
+        group_valid_count = 0
+        for idx in group_indices:
+            sibling_pool = [candidate for candidate in positive_indices if candidate != idx]
+            if not sibling_pool:
+                continue
+            source_idx = random.choice(sibling_pool)
+            context = contexts[source_idx]
+            valid_mask[idx] = True
+            prompt_by_idx[idx] = context["prompt"]
+            text_by_idx[idx] = context["text"]
+            source_idx_by_idx[idx] = source_idx
+            sibling_pool_sizes.append(len(sibling_pool))
+            group_valid_count += 1
+
+        if group_valid_count:
+            valid_group_count += 1
+        else:
+            groups_without_nonself_success += 1
+
+    valid_sample_count = int(valid_mask.sum())
+    group_count = len(groups)
+    step_metrics = {
+        "self_rollout_distill/valid_group_ratio": float(valid_group_count / max(group_count, 1)),
+        "self_rollout_distill/valid_group_count": float(valid_group_count),
+        "self_rollout_distill/group_count": float(group_count),
+        "self_rollout_distill/groups_without_success": float(groups_without_success),
+        "self_rollout_distill/groups_without_nonself_success": float(groups_without_nonself_success),
+        "self_rollout_distill/valid_sample_count": float(valid_sample_count),
+        "self_rollout_distill/skipped_sample_count": float(batch_size - valid_sample_count),
+        "self_rollout_distill/sibling_pool_size_mean": (
+            float(np.mean(sibling_pool_sizes)) if sibling_pool_sizes else 0.0
+        ),
+        "self_rollout_distill/actor_pad_count": 0.0,
+        "self_rollout_distill/actor_padded_batch_size": float(valid_sample_count),
+    }
+
+    if loss_mode == "srpo":
+        # SRPO's m_i route must preserve samples that have no successful sibling:
+        # they receive a finite placeholder teacher input but teacher_available=0,
+        # so the loss uses their ordinary GRPO branch and ignores teacher outputs.
+        teacher_prompts = []
+        privileged_texts = []
+        source_indices = []
+        for idx in range(batch_size):
+            if valid_mask[idx]:
+                teacher_prompts.append(prompt_by_idx[idx])
+                privileged_texts.append(text_by_idx[idx])
+                source_indices.append(source_idx_by_idx[idx])
+                continue
+
+            fallback_context = _materialize_teacher_context(
+                self,
+                problem=problems[idx],
+                answer="teacher unavailable",
+                solution="No verified successful sibling is available for this rollout.",
+            )
+            teacher_prompts.append(fallback_context["prompt"])
+            privileged_texts.append(fallback_context["text"])
+            source_indices.append(None)
+
+        step_metrics["self_rollout_distill/teacher_available_ratio"] = float(
+            valid_sample_count / max(batch_size, 1)
+        )
+        step_metrics["self_rollout_distill/actor_padded_batch_size"] = float(batch_size)
+        self._aligned_teacher_rollout_details = {
+            "privileged_texts": privileged_texts,
+            "teacher_prompts": teacher_prompts,
+            "effective_modes": ["solution_answer"] * batch_size,
+            "privileged_text_sources": ["self_rollout"] * batch_size,
+            "self_rollout_source_indices": source_indices,
+        }
+        self._rlcsd_step_metrics = step_metrics
+        teacher_batch = _build_teacher_batch_from_prompts(
+            self,
+            teacher_prompts=teacher_prompts,
+            responses=batch.batch["responses"],
+            prefix="teacher",
+        )
+        teacher_batch.batch["teacher_available"] = torch.from_numpy(valid_mask.copy())
+        return teacher_batch
+
+    if not valid_mask.any():
+        filtered_batch = batch.select_idxs(valid_mask)
+        batch.batch = filtered_batch.batch
+        batch.non_tensor_batch = filtered_batch.non_tensor_batch
+        batch.meta_info["skip_actor_update"] = True
+        step_metrics["self_rollout_distill/skip_actor_update"] = 1.0
+        self._aligned_teacher_rollout_details = {
+            "privileged_texts": [],
+            "teacher_prompts": [],
+            "effective_modes": [],
+            "self_rollout_source_indices": [],
+        }
+        self._rlcsd_step_metrics = step_metrics
+        return None
+
+    kept_indices = [idx for idx in range(batch_size) if valid_mask[idx]]
+    filtered_batch = batch.select_idxs(valid_mask)
+    batch.batch = filtered_batch.batch
+    batch.non_tensor_batch = filtered_batch.non_tensor_batch
+    batch.meta_info["self_rollout_distill_filtered"] = True
+
+    teacher_prompts = [prompt_by_idx[idx] for idx in kept_indices]
+    self._aligned_teacher_rollout_details = {
+        "privileged_texts": [text_by_idx[idx] for idx in kept_indices],
+        "teacher_prompts": teacher_prompts,
+        "effective_modes": ["solution_answer"] * len(kept_indices),
+        "privileged_text_sources": ["self_rollout"] * len(kept_indices),
+        "self_rollout_source_indices": [source_idx_by_idx[idx] for idx in kept_indices],
+    }
+    self._rlcsd_step_metrics = step_metrics
+    return _build_teacher_batch_from_prompts(
+        self,
+        teacher_prompts=teacher_prompts,
+        responses=batch.batch["responses"],
+        prefix="teacher",
+    )
+
+
 # ------------------------------------------------------------------ #
 # Step 3: Compute teacher log probs (called during training phase)
 # ------------------------------------------------------------------ #
 
 def _compute_teacher_log_probs(self, batch: DataProto) -> DataProto | None:
-    """Build teacher-side inputs from cached GT privileged prompts."""
+    """Build teacher-side inputs from GT CoT or successful self-rollouts."""
     loss_mode = _cfg_get(self, "loss_mode", "vanilla")
     self._data_metric_overrides = {}
     if loss_mode not in DISTILL_LOSS_MODES:
         return None
     if loss_mode in RLCSD_LOSS_MODES:
         return _compute_rlcsd_teacher_inputs(self, batch)
+
+    privileged_text_source = _normalize_privileged_text_source(
+        _custom_cfg_get(self, "privileged_text_source", "gt_cot")
+    )
+    if privileged_text_source == "self_rollout":
+        return _compute_self_rollout_teacher_inputs(self, batch)
 
     self._rlcsd_step_metrics = {}
 
@@ -896,11 +1151,14 @@ def _compute_teacher_log_probs(self, batch: DataProto) -> DataProto | None:
     batch.non_tensor_batch["teacher_prompt_tokens_after_trunc"] = np.asarray(
         teacher_prompt_lens, dtype=np.float32
     )
-    return _build_teacher_batch_from_prompts(
+    teacher_batch = _build_teacher_batch_from_prompts(
         self,
         teacher_prompts=teacher_prompts,
         responses=responses,
         prefix="teacher")
+    if loss_mode == "srpo":
+        teacher_batch.batch["teacher_available"] = torch.ones(batch_size, dtype=torch.bool)
+    return teacher_batch
 
 
 def _judge_rationales(self) -> dict:
@@ -968,6 +1226,12 @@ def _save_train_rollout(self, batch: DataProto):
     privileged_texts = aligned_context.get("privileged_texts", []) if aligned_context is not None else []
     teacher_prompts = aligned_context.get("teacher_prompts", []) if aligned_context is not None else []
     effective_modes = aligned_context.get("effective_modes", []) if aligned_context is not None else []
+    privileged_text_sources = (
+        aligned_context.get("privileged_text_sources", []) if aligned_context is not None else []
+    )
+    self_rollout_source_indices = (
+        aligned_context.get("self_rollout_source_indices", []) if aligned_context is not None else []
+    )
     correct_hint_sources = aligned_context.get("correct_privileged_hint_sources", []) if aligned_context is not None else []
     privileged_texts_correct = aligned_context.get("privileged_texts_correct", []) if aligned_context is not None else []
     privileged_texts_wrong = aligned_context.get("privileged_texts_wrong", []) if aligned_context is not None else []
@@ -997,6 +1261,10 @@ def _save_train_rollout(self, batch: DataProto):
             entry["teacher_prompt"] = teacher_prompts[i]
         if i < len(effective_modes):
             entry["privileged_text_mode"] = effective_modes[i]
+        if i < len(privileged_text_sources):
+            entry["privileged_text_source"] = privileged_text_sources[i]
+        if i < len(self_rollout_source_indices):
+            entry["self_rollout_source_index"] = self_rollout_source_indices[i]
         if i < len(correct_hint_sources):
             entry["correct_privileged_hint_source"] = correct_hint_sources[i]
         if i < len(privileged_texts_correct):
@@ -1027,7 +1295,7 @@ def _save_train_rollout(self, batch: DataProto):
 
     with open(filename, "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"Saved train rollout details to {filename} ({batch_size} samples)")
+    logger.info("Saved train rollout details to %s (%d samples)", filename, batch_size)
 
 
 # ------------------------------------------------------------------ #
@@ -1059,10 +1327,10 @@ def _ensure_legacy_worker_impl(config):
     if worker_impl == "disable":
         with open_dict(config):
             config.trainer.use_legacy_worker_impl = "enable"
-        print(
-            "[Self-Distill] Overriding trainer.use_legacy_worker_impl=disable -> enable. "
-            "Privileged teacher prompting and full-logit distillation are currently implemented "
-            "only in the legacy actor worker path."
+        logger.warning(
+            "Overriding trainer.use_legacy_worker_impl=disable -> enable: "
+            "privileged teacher prompting and full-logit distillation currently "
+            "require the legacy actor worker path."
         )
     return config
 

@@ -101,13 +101,29 @@ class DataParallelPPOActor(BasePPOActor):
         self.device_name = get_device_name()
         self.param_dtype = PrecisionType.to_dtype(self.config.fsdp_config.get("dtype", "bfloat16"))
 
-        # Self-distillation: teacher shadow weights (EMA / snapshot)
+        # Self-distillation: frozen / EMA / snapshot teacher shadow weights.
         self._teacher_shadow = None
         self._teacher_mode = _sd_cfg(config, "teacher_mode", "fixed")
         self._teacher_ema_decay = float(_sd_cfg(config, "ema_decay", 0.95))
         self._teacher_sync_interval = int(_sd_cfg(config, "teacher_sync_interval", 10))
         self._teacher_step_counter = 0
-        if self._teacher_mode in ("ema", "snapshot") and actor_optimizer is not None:
+        # The same implementation is also instantiated for the frozen reference
+        # policy.  Its config intentionally has no ``policy_loss`` section, so
+        # use the shared optional-config accessor instead of struct access.
+        policy_loss_mode = _sd_cfg(self.config, "loss_mode", "vanilla")
+        self_distill_loss_modes = {
+            "opsd",
+            "opsd_ectr",
+            "sdpo",
+            "srpo",
+            "rlsd",
+            "rlsd_ectr",
+            "rlcsd",
+        }
+        needs_teacher_shadow = self._teacher_mode in ("ema", "snapshot") or (
+            self._teacher_mode == "fixed" and policy_loss_mode in self_distill_loss_modes
+        )
+        if needs_teacher_shadow and actor_optimizer is not None:
             # Initialize shadow from current trainable params
             self._teacher_shadow = {}
             for name, param in self.actor_module.named_parameters():
@@ -593,35 +609,33 @@ class DataParallelPPOActor(BasePPOActor):
             return full_topk_indices
 
         assert attention_mask is not None, "attention_mask is required to align compact response tensors."
-        response_lengths = response_mask.sum(dim=1).to(dtype=torch.long)
-        predictor_starts = self._response_predictor_starts(attention_mask, response_lengths)
-        for row_idx, (row_len, predictor_start) in enumerate(
-            zip(response_lengths.tolist(), predictor_starts.tolist(), strict=True)
-        ):
-            if row_len <= 0:
-                continue
-            full_topk_indices[row_idx, predictor_start : predictor_start + row_len, :] = topk_indices[
-                row_idx, :row_len, :
-            ]
+        if response_length <= 0:
+            return full_topk_indices
+        # Map top-k entries by their fixed response positions, independently
+        # of the loss mask. Masked tokens and zero-loss padding replicas must
+        # not shift the teacher/student alignment.
+        predictor_start = self._response_predictor_start(attention_mask, response_length)
+        response_token_lengths = attention_mask[:, -response_length:].sum(dim=1).to(dtype=torch.long)
+        for row_idx, row_len in enumerate(response_token_lengths.tolist()):
+            if row_len > 0:
+                full_topk_indices[row_idx, predictor_start : predictor_start + row_len, :] = topk_indices[
+                    row_idx, :row_len, :
+                ]
         return full_topk_indices
 
-    def _response_predictor_starts(
-        self,
-        attention_mask: torch.Tensor,
-        response_lengths: torch.Tensor) -> torch.Tensor:
-        """Locate each row's first response predictor from its actual attended span."""
-        sequence_positions = torch.arange(attention_mask.shape[1], device=attention_mask.device)
-        last_attended = torch.where(
-            attention_mask.to(dtype=torch.bool),
-            sequence_positions.unsqueeze(0),
-            sequence_positions.new_full((1,), -1),
-        ).amax(dim=1)
-        predictor_starts = last_attended - response_lengths
-        nonempty_rows = response_lengths > 0
-        assert torch.all(predictor_starts[nonempty_rows] >= 0), (
+    def _response_predictor_start(self, attention_mask: torch.Tensor, response_length: int) -> int:
+        """Return the first predictor position for the contiguous response segment.
+
+        The attention mask is the left-padded prompt followed by the right-padded
+        response. Its fixed response width determines predictor positions,
+        independently of how many response tokens contribute to the loss.
+        """
+        response_start = attention_mask.shape[1] - int(response_length)
+        predictor_start = response_start - 1
+        assert predictor_start >= 0, (
             "Teacher inputs must contain at least one attended prompt token before every non-empty response."
         )
-        return predictor_starts
+        return predictor_start
 
     def _align_compact_response_tensor(
         self,
@@ -629,18 +643,22 @@ class DataParallelPPOActor(BasePPOActor):
         response_length: int,
         response_lengths: torch.Tensor,
         attention_mask: torch.Tensor) -> torch.Tensor:
-        """Map compact teacher-response tensors back to fixed student response length."""
-        predictor_starts = self._response_predictor_starts(attention_mask, response_lengths)
+        """Map full-sequence teacher tensors to the response segment.
+
+        Gather positions using the fixed response width and attention mask
+        before applying the loss mask. Counting only loss-bearing tokens
+        would misalign teacher logits for masked or zero-loss samples.
+        """
         aligned_shape = (tensor.shape[0], response_length, *tensor.shape[2:])
         aligned = tensor.new_zeros(aligned_shape)
-        for row_idx, (row_len, predictor_start) in enumerate(
-            zip(response_lengths.tolist(), predictor_starts.tolist(), strict=True)
-        ):
-            if row_len <= 0:
-                continue
-            aligned[row_idx, :row_len, ...] = tensor[
-                row_idx, predictor_start : predictor_start + row_len, ...
-            ]
+        if response_length > 0:
+            predictor_start = self._response_predictor_start(attention_mask, response_length)
+            response_token_lengths = attention_mask[:, -response_length:].sum(dim=1).to(dtype=torch.long)
+            for row_idx, row_len in enumerate(response_token_lengths.tolist()):
+                if row_len > 0:
+                    aligned[row_idx, :row_len, ...] = tensor[
+                        row_idx, predictor_start : predictor_start + row_len, ...
+                    ]
         return aligned
 
     def _chunked_rowwise_topk(self, logits: torch.Tensor, topk: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -699,8 +717,8 @@ class DataParallelPPOActor(BasePPOActor):
 
     # ---- Teacher shadow weight management ----
 
-    def _update_teacher_shadow(self):
-        """Update teacher shadow weights after optimizer step."""
+    def _update_teacher_shadow(self, global_step: int | None):
+        """Update teacher shadow once after the complete actor update."""
         if self._teacher_shadow is None:
             return
         self._teacher_step_counter += 1
@@ -710,7 +728,11 @@ class DataParallelPPOActor(BasePPOActor):
                 if name in self._teacher_shadow:
                     self._teacher_shadow[name].mul_(decay).add_(param.data.detach(), alpha=1 - decay)
         elif self._teacher_mode == "snapshot":
-            if self._teacher_step_counter % self._teacher_sync_interval == 0:
+            if self._teacher_sync_interval <= 0:
+                return
+            if global_step is None:
+                raise ValueError("snapshot teacher updates require data.meta_info['global_steps']")
+            if global_step > 0 and global_step % self._teacher_sync_interval == 0:
                 for name, param in self.actor_module.named_parameters():
                     if name in self._teacher_shadow:
                         self._teacher_shadow[name].copy_(param.data.detach())
@@ -718,10 +740,7 @@ class DataParallelPPOActor(BasePPOActor):
     @contextmanager
     def _teacher_forward_context(self):
         """Temporarily swap the actor into teacher mode for one or more forwards."""
-        if self._teacher_mode in ("ema", "snapshot"):
-            if self._teacher_shadow is None:
-                yield None
-                return
+        if self._teacher_shadow is not None:
             backup = {}
             for name, param in self.actor_module.named_parameters():
                 if name in self._teacher_shadow:
@@ -731,6 +750,10 @@ class DataParallelPPOActor(BasePPOActor):
         elif self._teacher_mode == "fixed" and hasattr(self.actor_module, "disable_adapter"):
             backup = None
             adapter_ctx = self.actor_module.disable_adapter()
+        elif self._teacher_mode == "fixed":
+            raise RuntimeError(
+                "fixed teacher requested without a frozen parameter shadow or a disable_adapter context"
+            )
         else:
             backup = None
             adapter_ctx = nullcontext()
@@ -1100,6 +1123,7 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         pad_token_id = data.meta_info.get("pad_token_id", 0)
         global_steps = data.meta_info.get("global_steps")
+        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
 
         select_keys = [
             "responses",
@@ -1119,6 +1143,12 @@ class DataParallelPPOActor(BasePPOActor):
             select_keys.append("teacher_log_probs")
         if "teacher_entropy" in data.batch.keys():
             select_keys.append("teacher_entropy")
+        if loss_mode == "srpo":
+            if "token_level_scores" not in data.batch.keys():
+                raise ValueError("srpo requires token_level_scores for correctness routing")
+            select_keys.append("token_level_scores")
+            if "teacher_available" in data.batch.keys():
+                select_keys.append("teacher_available")
         for teacher_key in ("teacher_input_ids", "teacher_attention_mask", "teacher_position_ids"):
             if teacher_key in data.batch.keys():
                 select_keys.append(teacher_key)
@@ -1160,8 +1190,8 @@ class DataParallelPPOActor(BasePPOActor):
             "actor/kl_loss": 0.0}
         for _ in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
-                mini_batch_loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                needs_teacher_forward = mini_batch_loss_mode in ("opsd", "opsd_ectr", "sdpo", "rlsd", "rlsd_ectr","rlcsd") and any(
+                mini_batch_loss_mode = loss_mode
+                needs_teacher_forward = mini_batch_loss_mode in ("opsd", "opsd_ectr", "sdpo", "srpo", "rlsd", "rlsd_ectr", "rlcsd") and any(
                     key in mini_batch.batch.keys()
                     for key in (
                         "teacher_input_ids",
@@ -1201,7 +1231,7 @@ class DataParallelPPOActor(BasePPOActor):
 
                     calculate_entropy = self.config.calculate_entropy or (entropy_coeff != 0)
                     loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    need_teacher = loss_mode in ("opsd", "opsd_ectr", "sdpo", "rlsd", "rlsd_ectr", "srpo","rlcsd")
+                    need_teacher = loss_mode in ("opsd", "opsd_ectr", "sdpo", "rlsd", "rlsd_ectr", "srpo", "rlcsd")
                     need_full_distill = need_teacher and loss_mode in ("opsd", "opsd_ectr", "sdpo", "srpo") and _sd_cfg(
                         self.config, "full_logit_distill", True
                     )
@@ -1499,6 +1529,9 @@ class DataParallelPPOActor(BasePPOActor):
                         loss_kwargs["teacher_wrong_multi_log_probs"] = teacher_wrong_multi_lp
                         loss_kwargs["teacher_wrong_multi_valid_mask"] = teacher_wrong_multi_valid_mask
                         loss_kwargs["teacher_wrong_multi_entropy"] = teacher_wrong_multi_ent
+                    if loss_mode == "srpo":
+                        loss_kwargs["rollout_scores"] = model_inputs["token_level_scores"]
+                        loss_kwargs["teacher_available"] = model_inputs.get("teacher_available")
                     pg_loss, pg_metrics = policy_loss_fn(**loss_kwargs)
                     micro_batch_metrics.update(pg_metrics)
 
@@ -1548,9 +1581,9 @@ class DataParallelPPOActor(BasePPOActor):
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
-                # Update teacher shadow weights after optimizer step
-                self._update_teacher_shadow()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+        # EMA/snapshot cadence is defined in trainer/global steps, not optimizer mini-steps.
+        self._update_teacher_shadow(global_step=global_steps)
         self.actor_optimizer.zero_grad()
         return metrics

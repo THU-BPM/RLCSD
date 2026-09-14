@@ -35,6 +35,7 @@ val_batch_size: 16
 teacher_enable_thinking: true
 
 privileged_text_mode: solution_answer
+privileged_text_source: gt_cot
 
 vllm_gpu_memory_utilization: 0.6
 vllm_tensor_parallel_size: 1
@@ -57,5 +58,5 @@ train_dataset: kk_4to8
 val_dataset: kk_4to8_test,kk_9,kk_10,kk_11
 use_swanlab: true
 project_name: rlcsd-qwen3_1_7b-logic_kk
-experiment_name: qwen3_1_7b_srpo
+experiment_name: srpo
 val_before_train: true

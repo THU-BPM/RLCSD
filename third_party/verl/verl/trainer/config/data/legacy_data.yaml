@@ -1,0 +1,73 @@
+# Dataset defaults shared by the PPO training configurations.
+# Values match the data section of _generated_ppo_trainer.yaml.
+
+tokenizer: null
+
+use_shm: false
+
+train_files: ~/data/rlhf/gsm8k/train.parquet
+
+val_files: ~/data/rlhf/gsm8k/test.parquet
+
+train_max_samples: -1
+
+val_max_samples: -1
+
+prompt_key: prompt
+
+reward_fn_key: data_source
+
+max_prompt_length: 512
+
+max_response_length: 512
+
+train_batch_size: 1024
+
+val_batch_size: null
+
+tool_config_path: ${oc.select:actor_rollout_ref.rollout.multi_turn.tool_config_path,
+  null}
+
+return_raw_input_ids: false
+
+return_raw_chat: true
+
+return_full_prompt: false
+
+shuffle: true
+
+seed: null
+
+dataloader_num_workers: 8
+
+image_patch_size: 14
+
+validation_shuffle: false
+
+filter_overlong_prompts: false
+
+filter_overlong_prompts_workers: 1
+
+truncation: error
+
+image_key: images
+
+video_key: videos
+
+trust_remote_code: false
+
+custom_cls:
+  path: null
+  name: null
+
+return_multi_modal_inputs: true
+
+sampler:
+  class_path: null
+  class_name: null
+
+datagen:
+  path: null
+  name: null
+
+apply_chat_template_kwargs: {}

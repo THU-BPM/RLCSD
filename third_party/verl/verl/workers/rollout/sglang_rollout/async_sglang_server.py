@@ -17,6 +17,7 @@ import dataclasses
 import json
 import logging
 import os
+import socket
 from typing import Any, Optional
 
 import ray
@@ -202,6 +203,29 @@ class SGLangHttpServer:
             **engine_kwargs,
         }
 
+        # SGLang's implicit free-port selection races when eight TP=1 engines
+        # launch concurrently on one host. Each replica owns one GPU, so give
+        # it a disjoint per-host port range and skip ports already held by
+        # Ray, agent-loop workers, or system services.
+        if self.nnodes == 1:
+            port_base = int(os.environ.get("RLCSD_NCCL_PORT_BASE", "24000"))
+            port_start = port_base + self.replica_rank * 32
+            for candidate in range(port_start, port_start + 32):
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                    try:
+                        # TCPStore listens on all IPv4 interfaces. Probing only
+                        # self._server_address can miss a listener bound to a
+                        # different interface and later fail with EADDRINUSE.
+                        probe.bind(("", candidate))
+                    except OSError:
+                        continue
+                args["nccl_port"] = candidate
+                break
+            else:
+                raise RuntimeError(
+                    f"No free NCCL port in [{port_start}, {port_start + 31}]"
+                )
+
         # update lora-related args
         if self.model_config.lora_rank > 0:
             args.update(
@@ -262,17 +286,21 @@ class SGLangHttpServer:
         sglang.srt.entrypoints.engine._set_envs_and_config = _set_envs_and_config
         os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
         server_args = ServerArgs(**args)
-        # For SGLang main branch or version >= 0.5.10
-        # The latest main branch of SGLang has wrapped the _launch_subprocesses function inside the Engine class
-        if version.parse(sglang.__version__) >= version.parse("0.5.10"):
-            from sglang.srt.entrypoints.http_server import Engine
+        # Prefer feature detection: internal/custom SGLang builds may expose a
+        # placeholder version such as 0.0.0 while already using the Engine API.
+        from sglang.srt.entrypoints import http_server
 
-            self.tokenizer_manager, self.template_manager, self.scheduler_info, *_ = Engine._launch_subprocesses(
+        engine_cls = getattr(http_server, "Engine", None)
+        if engine_cls is not None and hasattr(engine_cls, "_launch_subprocesses"):
+            launch_result = engine_cls._launch_subprocesses(
                 server_args=server_args,
                 init_tokenizer_manager_func=sglang.srt.entrypoints.engine.init_tokenizer_manager,
                 run_scheduler_process_func=sglang.srt.entrypoints.engine.run_scheduler_process,
                 run_detokenizer_process_func=sglang.srt.entrypoints.engine.run_detokenizer_process,
             )
+            self.tokenizer_manager, self.template_manager = launch_result[:2]
+            scheduler_result = launch_result[3] if hasattr(launch_result[3], "scheduler_infos") else None
+            self.scheduler_info = scheduler_result.scheduler_infos[0] if scheduler_result else launch_result[2]
         elif version.parse(sglang.__version__) >= version.parse("0.5.7"):
             from sglang.srt.entrypoints.http_server import _launch_subprocesses
 

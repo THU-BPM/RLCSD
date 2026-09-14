@@ -35,23 +35,24 @@ val_batch_size: 16
 teacher_enable_thinking: true
 
 privileged_text_mode: solution_answer
-correct_privileged_hint_source: self_rollout  # self_rollout | gt_cot
+privileged_text_source: gt_cot
+correct_privileged_hint_source: gt_cot
 
 vllm_gpu_memory_utilization: 0.6
 vllm_tensor_parallel_size: 1
 
 kl_loss_coef: 0
 epsilon: 0.2
-rlcsd_tau: 0.02
+rlcsd_tau: 1.3
 rlcsd_beta: 1.0
 rlcsd_lam: 0.5
 rlcsd_delta: 0.02
-rlcsd_eta: 1.0
+rlcsd_eta: 0.5
 rlcsd_residual_clip_low: -2.0
 rlcsd_residual_clip_high: 2.0
 rlcsd_k_max: 4
 teacher_sync_interval: 10
-teacher_mode: snapshot
+teacher_mode: fixed
 
 output_dir: ./outputs/logic_kk/Qwen3-8B/rlcsd
 data_dir: ./data
@@ -59,5 +60,5 @@ train_dataset: kk_4to8
 val_dataset: kk_4to8_test,kk_9,kk_10,kk_11
 use_swanlab: true
 project_name: rlcsd-qwen3_8b-logic_kk
-experiment_name: qwen3_8b_rlcsd
+experiment_name: rlcsd
 val_before_train: true

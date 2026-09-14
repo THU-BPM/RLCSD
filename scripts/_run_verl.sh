@@ -1,5 +1,9 @@
 #!/bin/bash
 set -eo pipefail
+
+# Export credentials before enabling xtrace so secrets are not copied into
+# persistent driver logs.
+export SWANLAB_API_KEY=${SWANLAB_API_KEY:-""}
 set -x
 
 # Base script: reads all params from a YAML config and launches verl training.
@@ -8,7 +12,6 @@ set -x
 CONFIG=${1:?Usage: $0 <config.yaml> [extra overrides...]}
 shift  # remaining args are extra hydra overrides
 
-export SWANLAB_API_KEY=${SWANLAB_API_KEY:-""}
 export CUDA_HOME=${CUDA_HOME:-"/usr/local/cuda-12.6"}
 export PATH="$CUDA_HOME/bin:$PATH"
 if [ -n "${HF_ENDPOINT}" ]; then export HF_ENDPOINT; fi
@@ -59,6 +62,7 @@ VAL_TEMP=$(Y val_temperature 0.6)
 VAL_TOP_P=$(Y val_top_p ${TOP_P})
 VAL_TOP_K=$(Y val_top_k ${TOP_K})
 VAL_BATCH_SIZE=$(Y val_batch_size 16)
+SHUFFLE=$(Y shuffle false)
 TEACHER_ENABLE_THINKING=$(Y teacher_enable_thinking true)
 THINKING_SYSTEM_PROMPT=$(Y thinking_system_prompt false)
 PROJECT=$(Y project_name rlcsd)
@@ -67,7 +71,12 @@ OUTPUT_DIR=$(Y output_dir "")
 VAL_BEFORE=$(Y val_before_train false)
 USE_SWANLAB=$(Y use_swanlab true)
 PRIVILEGED_TEXT_MODE=$(Y privileged_text_mode solution_answer)
-CORRECT_PRIVILEGED_HINT_SOURCE=$(Y correct_privileged_hint_source self_rollout)
+PRIVILEGED_TEXT_SOURCE=$(Y privileged_text_source gt_cot)
+DEFAULT_CORRECT_PRIVILEGED_HINT_SOURCE=gt_cot
+case "$METHOD" in
+    opsd_ectr|rlsd_ectr) DEFAULT_CORRECT_PRIVILEGED_HINT_SOURCE=gt_cot ;;
+esac
+CORRECT_PRIVILEGED_HINT_SOURCE=$(Y correct_privileged_hint_source "$DEFAULT_CORRECT_PRIVILEGED_HINT_SOURCE")
 # OPD (plain on-policy distillation) keys; only consumed when METHOD=opd.
 TEACHER_MODEL_PATH=$(Y teacher_model_path "")
 TEACHER_ENABLE_RESOURCE_POOL=$(Y teacher_enable_resource_pool false)
@@ -164,19 +173,6 @@ if [ "$USE_SWANLAB_LOWER" = "true" ]; then
     LOGGER='["console","tensorboard","file","swanlab"]'
 fi
 
-REWARD_ARGS=()
-if [ -n "$REWARD_MANAGER_NAME" ] && [ "$REWARD_MANAGER_NAME" != "None" ]; then
-    REWARD_ARGS+=(reward.reward_manager.name=${REWARD_MANAGER_NAME})
-fi
-if [ "$USE_CUSTOM_REWARD_FUNCTION_LOWER" = "true" ] \
-    && [ -n "$CUSTOM_REWARD_FUNCTION_PATH" ] && [ "$CUSTOM_REWARD_FUNCTION_PATH" != "None" ] \
-    && [ -n "$CUSTOM_REWARD_FUNCTION_NAME" ] && [ "$CUSTOM_REWARD_FUNCTION_NAME" != "None" ]; then
-    REWARD_ARGS+=(
-        reward.custom_reward_function.path=${CUSTOM_REWARD_FUNCTION_PATH}
-        reward.custom_reward_function.name=${CUSTOM_REWARD_FUNCTION_NAME}
-    )
-fi
-
 if [ "$USE_SWANLAB_LOWER" = "true" ] && [ -z "${SWANLAB_API_KEY}" ]; then
     echo "Warning: SWANLAB_API_KEY is empty; swanlab logging requires existing login state or an exported key" >&2
 fi
@@ -220,6 +216,9 @@ for arg in "$@"; do
         privileged_text_mode=*|+privileged_text_mode=*)
             PRIVILEGED_TEXT_MODE="${arg#*=}"
             ;;
+        privileged_text_source=*|+privileged_text_source=*)
+            PRIVILEGED_TEXT_SOURCE="${arg#*=}"
+            ;;
         correct_privileged_hint_source=*|+correct_privileged_hint_source=*)
             CORRECT_PRIVILEGED_HINT_SOURCE="${arg#*=}"
             ;;
@@ -250,6 +249,22 @@ for arg in "$@"; do
             ;;
     esac
 done
+
+# Build reward overrides only after command-line wrapper arguments have been
+# parsed.  Otherwise custom_reward_function_path/name overrides are silently
+# ignored and Ray workers resolve the YAML's relative path from their own cwd.
+REWARD_ARGS=()
+if [ -n "$REWARD_MANAGER_NAME" ] && [ "$REWARD_MANAGER_NAME" != "None" ]; then
+    REWARD_ARGS+=(reward.reward_manager.name=${REWARD_MANAGER_NAME})
+fi
+if [ "$USE_CUSTOM_REWARD_FUNCTION_LOWER" = "true" ] \
+    && [ -n "$CUSTOM_REWARD_FUNCTION_PATH" ] && [ "$CUSTOM_REWARD_FUNCTION_PATH" != "None" ] \
+    && [ -n "$CUSTOM_REWARD_FUNCTION_NAME" ] && [ "$CUSTOM_REWARD_FUNCTION_NAME" != "None" ]; then
+    REWARD_ARGS+=(
+        reward.custom_reward_function.path=${CUSTOM_REWARD_FUNCTION_PATH}
+        reward.custom_reward_function.name=${CUSTOM_REWARD_FUNCTION_NAME}
+    )
+fi
 
 PARQUET_ROOT="${DATA_ROOT%/}/verl"
 
@@ -304,6 +319,26 @@ normalize_correct_privileged_hint_source() {
     printf '%s' "$source"
 }
 
+normalize_privileged_text_source() {
+    local source="$1"
+    source="$(echo "$source" | tr '[:upper:]' '[:lower:]' | tr -- '- ' '__')"
+    case "$source" in
+        self|rollout)
+            source="self_rollout"
+            ;;
+        dataset|dataset_cot|ground_truth_cot|gt)
+            source="gt_cot"
+            ;;
+        self_rollout|gt_cot)
+            ;;
+        *)
+            echo "Invalid privileged_text_source '${1}'. Allowed values: self_rollout, gt_cot" >&2
+            return 1
+            ;;
+    esac
+    printf '%s' "$source"
+}
+
 ensure_dataset_parquet() {
     local split="$1"
     local dataset_name="$2"
@@ -329,6 +364,7 @@ if [ -z "$VAL_FILES" ] || [ "$VAL_FILES" = "None" ]; then
 fi
 
 PRIVILEGED_TEXT_MODE="$(normalize_privileged_text_mode "$PRIVILEGED_TEXT_MODE")"
+PRIVILEGED_TEXT_SOURCE="$(normalize_privileged_text_source "$PRIVILEGED_TEXT_SOURCE")"
 CORRECT_PRIVILEGED_HINT_SOURCE="$(normalize_correct_privileged_hint_source "$CORRECT_PRIVILEGED_HINT_SOURCE")"
 
 resolve_abs_path() {
@@ -453,17 +489,18 @@ ALGO=""
 for key in beta jsd_token_clip teacher_mode \
            full_logit_distill distill_add_tail \
            alpha top_k_distill is_clip ema_decay \
-           epsilon epsilon_w tau lam lam_decay_steps teacher_sync_interval \
+           epsilon epsilon_w tau lam teacher_sync_interval \
            rlcsd_tau rlcsd_beta rlcsd_lam rlcsd_delta rlcsd_eta \
            rlcsd_residual_clip_low rlcsd_residual_clip_high rlcsd_k_max \
            opsd_ectr_alpha opsd_ectr_log_w_floor opsd_ectr_cw_tau \
            rlsd_ectr_lam \
-           srpo_beta; do
+           srpo_beta srpo_correctness_threshold; do
     val=$(Y $key "")
     [ -n "$val" ] && [ "$val" != "None" ] && ALGO="$ALGO +actor_rollout_ref.actor.policy_loss.${key}=${val}"
 done
 if [ "$METHOD" != "grpo" ] && [ "$METHOD" != "opd" ]; then
     ALGO="$ALGO +actor_rollout_ref.rollout.custom.privileged_text_mode=${PRIVILEGED_TEXT_MODE}"
+    ALGO="$ALGO +actor_rollout_ref.rollout.custom.privileged_text_source=${PRIVILEGED_TEXT_SOURCE}"
     ALGO="$ALGO +actor_rollout_ref.rollout.custom.teacher_enable_thinking=${TEACHER_ENABLE_THINKING}"
     ALGO="$ALGO +actor_rollout_ref.rollout.custom.thinking_system_prompt=${THINKING_SYSTEM_PROMPT}"
 fi
@@ -560,7 +597,7 @@ python3 -m $MAIN \
     +data.thinking_system_prompt=${THINKING_SYSTEM_PROMPT} \
     data.filter_overlong_prompts=True \
     data.truncation=error \
-    data.shuffle=False \
+    data.shuffle=${SHUFFLE} \
     actor_rollout_ref.nccl_timeout=${NCCL_TIMEOUT} \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.model.use_remove_padding=True \

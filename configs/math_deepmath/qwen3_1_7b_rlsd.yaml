@@ -35,6 +35,7 @@ val_batch_size: 16
 teacher_enable_thinking: true
 
 privileged_text_mode: solution_answer
+privileged_text_source: gt_cot
 
 vllm_gpu_memory_utilization: 0.6
 vllm_tensor_parallel_size: 1
@@ -42,7 +43,6 @@ vllm_tensor_parallel_size: 1
 epsilon: 0.2
 epsilon_w: 0.2
 lam: 0.5
-lam_decay_steps: 50
 teacher_sync_interval: 10
 teacher_mode: snapshot
 
@@ -52,5 +52,5 @@ train_dataset: deepmath_filtered_level5_7
 val_dataset: amc23,aime24,aime25
 use_swanlab: true
 project_name: rlcsd-qwen3_1_7b-math_deepmath
-experiment_name: qwen3_1_7b_rlsd
+experiment_name: rlsd
 val_before_train: true

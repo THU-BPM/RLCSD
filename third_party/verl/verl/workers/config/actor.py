@@ -127,8 +127,12 @@ class PolicyLossConfig(BaseConfig):
     epsilon_w: float = 0.2
     tau: Optional[float] = None
     lam: float = 0.5
-    lam_decay_steps: int = 50
     teacher_sync_interval: int = 10
+    # ECTR variants: contrastive teacher-target/evidence parameters.
+    opsd_ectr_alpha: float = 0.5
+    opsd_ectr_log_w_floor: float = -30.0
+    opsd_ectr_cw_tau: float = 1.0
+    rlsd_ectr_lam: Optional[float] = None
     rlcsd2_w_tau: Optional[float] = None
     rlcsd2_snr_tau: Optional[float] = None
     rlcsd2_snr_alpha: Optional[float] = None

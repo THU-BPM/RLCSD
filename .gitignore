@@ -6,6 +6,7 @@ __pycache__/
 
 # Local data, checkpoints, logs
 data/
+!third_party/verl/verl/trainer/config/data/
 outputs/
 checkpoints/
 swanlog/

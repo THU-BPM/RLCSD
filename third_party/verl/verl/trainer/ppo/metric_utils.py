@@ -290,6 +290,7 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
         - "gen" uses only response tokens
         - Other stages ("ref", "values", "adv", "update_critic", "update_actor") use all tokens
           (prompt + response)
+        - Stages with zero tokens retain raw timings but omit undefined per-token timings.
     """
     response_info = _compute_response_info(batch)
     num_prompt_tokens = torch.sum(response_info["prompt_length"]).item()
@@ -306,6 +307,7 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
         **{
             f"timing_per_token_ms/{name}": timing_raw[name] * 1000 / num_tokens_of_section[name]
             for name in set(num_tokens_of_section.keys()) & set(timing_raw.keys())
+            if num_tokens_of_section[name] > 0
         },
     }
 

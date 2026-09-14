@@ -2542,18 +2542,6 @@ def _sd_distribution_metrics(
     return base
 
 
-def _sd_effective_lam(config, global_steps, default=0.5):
-    """Linearly decay lambda over lam_decay_steps, keeping step 1 at the initial value."""
-    lam = float(_sd_cfg(config, "lam", default))
-    lam_decay_steps = int(_sd_cfg(config, "lam_decay_steps", 0) or 0)
-    if lam_decay_steps <= 0 or global_steps is None:
-        return lam
-
-    step_index = max(int(global_steps) - 1, 0)
-    decay_progress = min(step_index / lam_decay_steps, 1.0)
-    return max(lam * (1.0 - decay_progress), 0.0)
-
-
 def _sd_prepare_distill_log_probs(
     student_all_log_probs,
     teacher_all_log_probs,
@@ -2826,7 +2814,7 @@ def compute_policy_loss_rlsd(old_log_prob, log_prob, advantages, response_mask,
     )
     epsilon = float(_sd_cfg(config, "epsilon", 0.2))
     epsilon_w = float(_sd_cfg(config, "epsilon_w", 0.2))
-    lam = _sd_effective_lam(config, kwargs.get("global_steps"), default=0.5)
+    lam = float(_sd_cfg(config, "lam", 0.5))
 
     log_ratio = log_prob - old_log_prob
     ratio = log_ratio.exp()
@@ -2870,7 +2858,9 @@ def compute_policy_loss_rlsd_ectr(old_log_prob, log_prob, advantages, response_m
     )
     epsilon = float(_sd_cfg(config, "epsilon", 0.2))
     epsilon_w = float(_sd_cfg(config, "epsilon_w", 0.2))
-    lam = _sd_effective_lam(config, kwargs.get("global_steps"), default=0.5)
+    # Keep backward compatibility with the shared RLSD `lam`, while allowing
+    # ECTR experiments to tune their contrast-specific coefficient separately.
+    lam = float(_sd_cfg(config, "rlsd_ectr_lam", _sd_cfg(config, "lam", 0.5)))
 
     log_ratio = log_prob - old_log_prob
     ratio = log_ratio.exp()
@@ -2924,11 +2914,11 @@ def compute_policy_loss_rlcsd(old_log_prob, log_prob, advantages, response_mask,
     )
 
     epsilon = float(_sd_cfg(config, "epsilon", 0.2))
-    tau = max(float(_sd_cfg(config, "rlcsd_tau", _sd_cfg(config, "tau", 0.03))), 1e-6)
+    tau = max(float(_sd_cfg(config, "rlcsd_tau", _sd_cfg(config, "tau", 1.3))), 1e-6)
     beta = float(_sd_cfg(config, "rlcsd_beta", 0.2))
     lam = float(_sd_cfg(config, "rlcsd_lam", _sd_cfg(config, "lam", 0.5)))
     delta = max(float(_sd_cfg(config, "rlcsd_delta", 0.02)), 0.0)
-    eta = max(float(_sd_cfg(config, "rlcsd_eta", 1.0)), 0.0)
+    eta = max(float(_sd_cfg(config, "rlcsd_eta", 0.5)), 0.0)
     residual_clip_low = float(_sd_cfg(config, "rlcsd_residual_clip_low", -0.5))
     residual_clip_high = float(_sd_cfg(config, "rlcsd_residual_clip_high", 0.5))
     if residual_clip_low > residual_clip_high:
@@ -3071,11 +3061,10 @@ def compute_policy_loss_srpo(old_log_prob, log_prob, advantages, response_mask,
             / (Σ_{i,t} z^GRPO_i + Σ_{i,t} z^SDPO_i)
     where z^SDPO_i = (1 - c_i) m_i and z^GRPO_i = 1 - z^SDPO_i.
 
-    The correctness flag c_i is read from the per-rollout sign of the GRPO
-    advantage (a positive group-normalized advantage corresponds to a higher
-    reward than the group mean, equivalent to "correct" in the binary-reward
-    regime when the group is mixed). Teacher availability m_i is taken to be 1
-    whenever teacher_log_probs are present.
+    The correctness flag c_i is read from the raw per-rollout score, not the
+    group-normalized advantage. Teacher availability m_i is provided explicitly
+    by the teacher-data pipeline. This keeps homogeneous all-correct groups on
+    the GRPO branch and falls back to GRPO when no valid teacher exists.
 
     Hyperparameters (read from config.policy_loss):
         srpo_beta:           dynamic-weighting temperature β (default 1.0).
@@ -3087,12 +3076,20 @@ def compute_policy_loss_srpo(old_log_prob, log_prob, advantages, response_mask,
     """
     teacher_lp = kwargs.get("teacher_log_probs")
     teacher_ent = kwargs.get("teacher_entropy")
+    rollout_scores = kwargs.get("rollout_scores")
+    teacher_available = kwargs.get("teacher_available")
     assert teacher_lp is not None, (
         "SRPO requires teacher_log_probs (feedback-conditioned self-teacher). "
         "Ensure the SDPO teacher pipeline is enabled for this method."
     )
     assert teacher_ent is not None, (
         "SRPO requires teacher_entropy for entropy-aware dynamic weighting."
+    )
+    assert rollout_scores is not None, (
+        "SRPO requires raw rollout_scores for correctness routing; normalized advantages are insufficient."
+    )
+    assert teacher_available is not None, (
+        "SRPO requires an explicit teacher_available mask for GRPO fallback routing."
     )
 
     beta = float(_sd_cfg(config, "srpo_beta", 1.0))
@@ -3109,12 +3106,30 @@ def compute_policy_loss_srpo(old_log_prob, log_prob, advantages, response_mask,
 
     valid_mask = response_mask.to(log_prob.dtype)
 
-    # ---- Sample-level routing: c_i from per-rollout advantage sign --------
-    rollout_token_count = valid_mask.sum(dim=1).clamp(min=1.0)
-    rollout_adv = (advantages * valid_mask).sum(dim=1) / rollout_token_count
-    correct_per_rollout = (rollout_adv > 0).to(log_prob.dtype)         # c_i
-    sdpo_per_rollout = 1.0 - correct_per_rollout                        # z^SDPO_i (m_i = 1)
-    grpo_per_rollout = 1.0 - sdpo_per_rollout                           # z^GRPO_i
+    # ---- Sample-level routing: z^SDPO_i = (1 - c_i) m_i --------------
+    if rollout_scores.dim() > 1:
+        rollout_scores = rollout_scores.sum(dim=-1)
+    rollout_scores = rollout_scores.reshape(-1).to(device=log_prob.device, dtype=log_prob.dtype)
+    if rollout_scores.shape[0] != log_prob.shape[0]:
+        raise ValueError(
+            f"SRPO rollout_scores batch mismatch: {rollout_scores.shape[0]} != {log_prob.shape[0]}"
+        )
+    correctness_threshold = float(_sd_cfg(config, "srpo_correctness_threshold", 0.5))
+    correct_per_rollout = (rollout_scores >= correctness_threshold).to(log_prob.dtype)
+
+    if teacher_available.dim() > 1:
+        teacher_available = teacher_available.reshape(teacher_available.shape[0], -1).any(dim=-1)
+    teacher_available_per_rollout = teacher_available.reshape(-1).to(
+        device=log_prob.device, dtype=log_prob.dtype
+    )
+    if teacher_available_per_rollout.shape[0] != log_prob.shape[0]:
+        raise ValueError(
+            "SRPO teacher_available batch mismatch: "
+            f"{teacher_available_per_rollout.shape[0]} != {log_prob.shape[0]}"
+        )
+
+    sdpo_per_rollout = (1.0 - correct_per_rollout) * teacher_available_per_rollout
+    grpo_per_rollout = 1.0 - sdpo_per_rollout
 
     grpo_mask = grpo_per_rollout.unsqueeze(1) * valid_mask
     sdpo_mask = sdpo_per_rollout.unsqueeze(1) * valid_mask
@@ -3201,6 +3216,7 @@ def compute_policy_loss_srpo(old_log_prob, log_prob, advantages, response_mask,
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
         "actor/ppo_kl": ppo_kl.detach().item(),
         "srpo/correct_rollout_frac": correct_per_rollout.mean().detach().item(),
+        "srpo/teacher_available_frac": teacher_available_per_rollout.mean().detach().item(),
         "srpo/sdpo_token_frac": (sdpo_mask.sum() / valid_mask.sum().clamp(min=1.0)).detach().item(),
         "srpo/grpo_loss_term": (grpo_term / denom).detach().item(),
         "srpo/sdpo_loss_term": (sdpo_term / denom).detach().item(),

@@ -35,23 +35,24 @@ val_batch_size: 16
 teacher_enable_thinking: true
 
 privileged_text_mode: solution_answer
-correct_privileged_hint_source: self_rollout  # self_rollout | gt_cot
+privileged_text_source: gt_cot
+correct_privileged_hint_source: gt_cot
 
 vllm_gpu_memory_utilization: 0.6
 vllm_tensor_parallel_size: 1
 
 kl_loss_coef: 0
 epsilon: 0.2
-rlcsd_tau: 0.02
+rlcsd_tau: 1.3
 rlcsd_beta: 1.0
 rlcsd_lam: 0.5
 rlcsd_delta: 0.02
-rlcsd_eta: 1.0
+rlcsd_eta: 0.5
 rlcsd_residual_clip_low: -2.0
 rlcsd_residual_clip_high: 2.0
 rlcsd_k_max: 4
 teacher_sync_interval: 10
-teacher_mode: snapshot
+teacher_mode: fixed
 
 output_dir: ./outputs/math_deepmath/Olmo3-7B-Think/rlcsd
 data_dir: ./data
@@ -59,5 +60,5 @@ train_dataset: deepmath_filtered_level7_10
 val_dataset: amc23,aime24,aime25
 use_swanlab: true
 project_name: rlcsd-olmo3_7b_think-math_deepmath
-experiment_name: olmo3_7b_think_rlcsd
+experiment_name: rlcsd
 val_before_train: true

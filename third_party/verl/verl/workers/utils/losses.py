@@ -84,7 +84,14 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics = {}
 
     # select fields and convert to padded tensor
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
     fields = ["response_mask", "old_log_probs", "advantages"]
+    if loss_mode == "srpo":
+        if "token_level_scores" not in data:
+            raise ValueError("srpo requires token_level_scores for correctness routing")
+        if "teacher_available" not in data:
+            raise ValueError("srpo requires teacher_available for routing")
+        fields.extend(("token_level_scores", "teacher_available"))
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -115,8 +122,6 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     rollout_is_weights = data.get("rollout_is_weights", None)
 
     loss_agg_mode = config.loss_agg_mode
-
-    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     # Self-distillation: teacher_log_probs computed with privileged context
     # by _compute_teacher_log_probs in self_distill_main.py
@@ -168,6 +173,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     if loss_mode in ("opsd", "sdpo", "rlsd", "srpo"):
         loss_kwargs["teacher_log_probs"] = teacher_log_probs
         loss_kwargs["teacher_entropy"] = teacher_entropy_vals
+        if loss_mode == "srpo":
+            loss_kwargs["rollout_scores"] = data["token_level_scores"]
+            loss_kwargs["teacher_available"] = data["teacher_available"]
     elif loss_mode == "rlsd_ectr":
         loss_kwargs["teacher_log_probs"] = teacher_log_probs
         loss_kwargs["teacher_wrong_log_probs"] = teacher_wrong_log_probs

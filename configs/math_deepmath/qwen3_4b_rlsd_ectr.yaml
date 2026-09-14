@@ -35,6 +35,7 @@ val_batch_size: 16
 teacher_enable_thinking: true
 
 privileged_text_mode: solution_answer
+correct_privileged_hint_source: gt_cot
 
 vllm_gpu_memory_utilization: 0.6
 vllm_tensor_parallel_size: 1
@@ -42,7 +43,6 @@ vllm_tensor_parallel_size: 1
 epsilon: 0.2
 epsilon_w: 0.2
 lam: 0.5
-lam_decay_steps: 50
 teacher_sync_interval: 10
 teacher_mode: snapshot
 

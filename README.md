@@ -6,78 +6,83 @@
 
 </div>
 
-🚨 **IMPORTANT NOTICE:** We have identified several implementation
-  bugs and are actively fixing them and rerunning all affected experiments. We
-  expect to complete this work within one month. Please do not use the current
-  repository for experiments until this notice is updated.
-
-## News
-
-- **2026-08-17** — Added `correct_privileged_hint_source=gt_cot`, which uses
-  the dataset-provided ground-truth reasoning trace as RLCSD's correct
-  privileged hint. The [main results](#main-results-across-model-scales) now
-  report both GT CoT and self-rollout variants. Overall, self-rollout remains
-  the more stable default, especially on larger-model logical reasoning and
-  Olmo-3-7B, while GT CoT achieves higher scores on several datasets.
-- **2026-06-05** — Initial open-source release of the RLCSD training code,
-  experiment configurations, and evaluation setup.
-
 ## Introduction
 
 On-policy self-distillation (OPSD) gives reasoning models dense, token-level
-supervision by aligning a model's own distribution with the distribution it
-produces under a privileged context (typically a verified solution). We show
-that this distributional gap is dominated by **style tokens** rather than
-**task-bearing tokens** — a pathology we call *privilege-induced style drift*,
-which destabilizes training and collapses response length.
+supervision by aligning the student's distribution with a teacher distribution
+conditioned on privileged context, typically a verified solution. This context
+can also favor shorter, more assertive phrasing and suppress exploratory
+reasoning. We call this **privilege-induced style drift**: the resulting
+signal concentrates on **style tokens** and dilutes supervision on
+**task-bearing tokens**, contributing to premature response-length shrinkage
+and, in some methods, training instability.
 
-**RLCSD** removes this drift by **contrasting the teacher–student gap under a
-correct hint against the gap under a *wrong* hint** produced under an identical
-prompt template. The shared stylistic component cancels in the subtraction,
-leaving a token-level signal that is more concentrated on task-bearing tokens.
-We then integrate this signal into GRPO as a verifier-anchored modulation of
-the outcome advantage, instead of a replacement for it. On Qwen3 (1.7B / 4B /
-8B) and Olmo-3-7B-Think, across DeepMath (AMC23 / AIME24 / AIME25) and Knights
-& Knaves, RLCSD **consistently outperforms GRPO and every prior OPSD baseline
-we tested**, while keeping training dynamics stable where existing methods
-either explode or collapse.
+**RLCSD** contrasts the teacher–student gaps under a correct and an incorrect
+reference solution, presented with the same prompt template. This suppresses
+shared stylistic shifts and makes the remaining token-level signal more
+focused on task correctness. RLCSD uses that signal to modulate the
+verifier-derived GRPO advantage while preserving its update direction.
+
+Across Qwen3 (1.7B / 4B / 8B) and Olmo-3-7B-Think, RLCSD achieves the highest
+math and logic averages among the evaluated methods. Math training uses
+DeepMath, with evaluation on AMC23, AIME24, and AIME25; logical reasoning
+uses Knights & Knaves at both in-domain and harder out-of-domain role counts.
 
 <p align="center">
-  <img src="assets/benchmarks_qwen3_8b.png" width="95%" alt="RLCSD vs baselines on Qwen3-8B"/>
+  <img src="assets/rlcsd_overview.png" width="95%" alt="Figure 1: token-level motivation (a), response length and reward during training (b), and math and logic averages across four model scales (c)"/>
 </p>
+
+Figure 1: (a) the largest one-sided and contrastive signals concentrate on
+different token types; (b) RLCSD preserves response length and stable training
+reward; (c) average math mean@12 and Knights & Knaves pass@1 across all four
+model scales. The logic average includes both ID and OOD settings.
 
 ## Method overview
 
 <p align="center">
-  <img src="assets/method_pipeline.png" width="95%" alt="RLCSD three-stage pipeline"/>
+  <img src="assets/method_pipeline.png" width="95%" alt="Figure 3: rollout sampling, contrastive token-level signal, and verifier-anchored two-path optimization"/>
 </p>
+
+Figure 3 illustrates the self-rollout option for the positive hint. **The main
+experiments use dataset-provided ground-truth reasoning traces (GT CoT)** as
+positive hints; incorrect student rollouts supply the negative hints. RLCSD's
+teacher is initialized from the same pretrained checkpoint as the student and
+**kept fixed throughout training**.
 
 For each query we run three stages:
 
-1. **Rollout sampling and partitioning.** Sample G rollouts from the student
-   and split them into a correct set 𝒢⁺ and an incorrect set 𝒢⁻ using a
-   rule-based verifier (binary reward).
-2. **Contrastive token-level signal.** Draw a positive hint y\*<sub>c</sub> from
-   𝒢⁺ and *K* negative hints {y\*<sub>w,k</sub>} from 𝒢⁻, wrap each in an
-   identical "Reference Solution" template, and form
+1. **Rollout sampling and outcome evaluation.** Sample G student rollouts,
+   score them with a binary rule-based verifier, and partition them into
+   correct (𝒢⁺) and incorrect (𝒢⁻) subsets. The verifier outcomes provide
+   the group-relative advantage A<sub>ORM</sub>.
+2. **Contrastive token-level signal.** Pair a correct reference y\*<sub>c</sub>
+   with K incorrect student rollouts y\*<sub>w,k</sub> from the same query.
+   Both branches use an identical reference-solution template, including the
+   reasoning trace and final answer. Compute
 
    ```
-   e_ctr,t = log π_T(y_t | x, y*_c, y_<t) − log (1/K) Σ_k π_T(y_t | x, y*_{w,k}, y_<t)
+   p_c,t   = π_T(y_t | x, y*_c, y_<t)
+   p_w,k,t = π_T(y_t | x, y*_{w,k}, y_<t)
+   e_ctr,t = log(p_c,t) − log((1/K) Σ_{k=1}^K p_w,k,t)
    ```
 
-   Two refinements matter: (i) **K-marginalize the negative branch** to stay
-   robust against error-type mismatch between the target rollout and the
-   sampled negative, and (ii) **exclude the target rollout from the hint
-   pool** to avoid self-conditioning over-confidence.
-3. **Verifier-anchored modulation & two-path loss.** Convert e<sub>ctr,t</sub>
-   into a bounded modulation r<sub>t</sub> via a tanh squash, gate it with a
-   threshold mask, and add it to A<sub>ORM</sub> under a sign-preserving clamp
-   so the verifier always decides the update direction. Aggregate as a two-
-   path PPO-style clipped loss with independent normalization for unmodulated
-   and modulated token sets.
+   **Average negative-hint probabilities before taking the logarithm** to
+   reduce sensitivity to individual error types. **Exclude the target
+   rollout from every rollout-derived hint pool**: negatives come from
+   𝒢⁻ ∖ {y}; optional self-rollout positives come from 𝒢⁺ ∖ {y}.
+3. **Verifier-anchored modulation and two-path loss.** Set
+   r<sub>t</sub> = λ tanh(e<sub>ctr,t</sub> / τ) and select tokens with
+   |r<sub>t</sub>| > δ. Add the modulation to A<sub>ORM</sub> and clamp at
+   zero to prevent a reversal of the verifier's update direction. Within
+   each rollout, independently average the PPO clipped objective over the
+   unmodulated and modulated token sets, weighting the latter by η; omit
+   an empty path. Average across rollouts and queries, and minimize the
+   negative of this objective. Independent normalization prevents the
+   selected tokens (roughly 20%–30%) from being diluted by the other tokens.
 
-See the paper for derivations of (1)–(3) and ablations on each
-design choice.
+See Sections 3.3–3.6 for the construction and loss, Section 4.4 for component
+ablations, and Appendix F for hyperparameter sensitivity. The paper uses
+**K = 4, τ = 1.3, λ = 0.5, δ = 0.02, and η = 0.5**.
 
 ## Methods supported in this repo
 
@@ -189,14 +194,16 @@ override individual hyperparameters, append Hydra-style overrides:
 bash scripts/math_deepmath/run_qwen3_4b_rlcsd.sh learning_rate=2e-6 group_size=16
 ```
 
-RLCSD uses a verified sibling rollout as its correct privileged hint by
-default. Set `correct_privileged_hint_source` to `gt_cot` to use the dataset's
-ground-truth `extra_info.solution` for the correct branch instead; the wrong
-branch still comes from incorrect sibling rollouts and excludes the target
-itself when the target is incorrect:
+The shipped RLCSD configs use `correct_privileged_hint_source=gt_cot` and
+`teacher_mode=fixed`, matching the paper's main setup. The correct branch uses
+the dataset's ground-truth `extra_info.solution`; the wrong branch uses
+incorrect sibling rollouts and excludes the target itself.
+
+To opt into a verified sibling rollout for the correct branch, override the
+hint source:
 
 ```bash
-bash scripts/math_deepmath/run_qwen3_4b_rlcsd.sh correct_privileged_hint_source=gt_cot
+bash scripts/math_deepmath/run_qwen3_4b_rlcsd.sh correct_privileged_hint_source=self_rollout
 ```
 
 Common environment overrides:
@@ -205,135 +212,167 @@ Common environment overrides:
 - `HF_ENDPOINT` — e.g. `https://hf-mirror.com` for a HuggingFace mirror
 - `CUDA_HOME` — defaults to `/usr/local/cuda-12.6`
 
+### Training logic updates
+
+The Math/Logic training updates use GT CoT by default for RLCSD. Self-rollout
+remains an opt-in implementation capability, without dedicated RLCSD self-rollout
+YAML configurations or launch scripts. Environment integrations and cluster
+operations are excluded.
+
 ## Results
+
+### Experimental setup
+
+The paper uses full-parameter training on **8 H20 GPUs**, a learning rate of
+**1 × 10⁻⁶**, and thinking mode during training and evaluation. The generation
+budgets are **16,384 tokens for training** and **38,912 for validation**.
+All OPSD baselines and RLCSD use **GT CoT** as the correct privileged context;
+RLCSD additionally uses incorrect student rollouts and keeps its teacher fixed
+(Section 4.1 and Appendix B).
 
 ### Main results across model scales
 
-We report two RLCSD variants: **Self-Roll.** uses the model's own verified
-successful rollout as the correct privileged context, while **GT CoT** uses the
-ground-truth reasoning trace from the dataset. Taking the better variant for
-each task family, the gains over the Base model are **+4.3 / +14.0**
-(math / logic) at 1.7B, **+2.9 / +6.8** at 4B, **+2.8 / +14.4** at 8B, and
-**+1.8 / +9.9** on Olmo-3-7B.
+Table 1 reports one RLCSD row per model.
+RLCSD achieves the highest math and logic averages across all four model
+blocks. Its gains over the Base model are **+4.6 / +12.9** (math / logic)
+at 1.7B, **+2.9 / +8.1** at 4B, **+2.5 / +9.7** at 8B, and **+1.8 / +9.9**
+on Olmo-3-7B.
 
-| Model       | Method          | AMC23 | AIME24 | AIME25 | Math Avg.       | KK 4–8 | KK 9 | KK 10 | KK 11 | Logic Avg.      |
-|-------------|-----------------|------:|-------:|-------:|----------------:|-------:|-----:|------:|------:|----------------:|
-| Qwen3-1.7B  | Base            | 74.1  | 48.3   | 33.3   | 51.9            | 63.2   | 53.0 | 43.0  | 31.0  | 47.6            |
-|             | GRPO            | 76.6  | 51.6   | 37.2   | 55.1            | 67.4   | 59.0 | 52.0  | 34.0  | 53.1            |
-|             | OPSD            | 76.3  | 50.8   | 37.7   | 54.9            | 64.4   | 55.0 | 52.0  | 32.0  | 50.9            |
-|             | SDPO            | 72.9  | 42.2   | 33.6   | 49.6            | 67.4   | 61.0 | 54.0  | 30.0  | 53.1            |
-|             | SRPO            | 73.2  | 43.6   | 34.4   | 50.4            | 64.4   | 58.0 | 47.0  | 33.0  | 50.6            |
-|             | RLSD            | 73.9  | 46.1   | 36.9   | 52.3            | 66.8   | 59.0 | 50.0  | 35.0  | 52.7            |
-|             | **RLCSD (Self-Roll.)** | 77.2 | 53.1 | **38.3** | **56.2** (+4.3) | 70.0 | 63.0 | 63.0 | 38.0 | 58.5 (+10.9) |
-|             | **RLCSD (GT CoT)** | **77.3** | **53.3** | 38.1 | **56.2** (+4.3) | **71.2** | **70.0** | **65.0** | **40.0** | **61.6** (+14.0) |
-| Qwen3-4B    | Base            | 88.6  | 72.5   | 65.3   | 75.5            | 73.2   | 67.0 | 58.0  | 42.0  | 60.1            |
-|             | GRPO            | 89.1  | **75.8** | 66.1   | 77.0            | 75.4   | 71.0 | 61.0  | 45.0  | 63.1            |
-|             | OPSD            | 89.4  | 74.2   | 67.5   | 77.0            | 73.4   | 71.0 | 62.0  | 42.0  | 62.1            |
-|             | SDPO            | 88.3  | 68.3   | 64.4   | 73.7            | 74.4   | 72.0 | 62.0  | 45.0  | 63.4            |
-|             | SRPO            | 87.9  | 71.4   | 64.7   | 74.7            | 75.0   | 71.0 | 61.0  | 45.0  | 63.0            |
-|             | RLSD            | 86.9  | 71.2   | 66.9   | 75.0            | 76.8   | 72.0 | 63.0  | 48.0  | 65.0            |
-|             | **RLCSD (Self-Roll.)** | 90.1 | 74.4 | **69.4** | 78.0 (+2.5) | **78.6** | 73.0 | 66.0 | **50.0** | **66.9** (+6.8) |
-|             | **RLCSD (GT CoT)** | **90.4** | **75.8** | 68.9 | **78.4** (+2.9) | 77.2 | **75.0** | **67.0** | 48.0 | 66.8 (+6.7) |
-| Qwen3-8B    | Base            | 88.8  | 74.2   | 66.9   | 76.6            | 72.4   | 67.0 | 55.0  | 44.0  | 59.6            |
-|             | GRPO            | 90.1  | 76.1   | 69.7 | 78.6          | 76.8   | 75.0 | 63.0  | 49.0  | 66.0            |
-|             | OPSD            | 90.4  | 76.9   | 68.7   | 78.7            | 75.2   | 74.0 | 61.0  | 49.0  | 64.8            |
-|             | SDPO            | 88.8  | 76.1   | 65.6   | 76.8            | 72.4   | 72.0 | 56.0  | 46.0  | 61.6            |
-|             | SRPO            | 88.3  | 75.3   | 65.6   | 76.4            | 74.8   | 72.0 | 60.0  | 49.0  | 64.0            |
-|             | RLSD            | 88.7  | 75.5   | 67.2   | 77.1            | 76.6   | 77.0 | 64.0  | 52.0  | 67.4            |
-|             | **RLCSD (Self-Roll.)** | **90.8** | **77.5** | 69.7 | 79.3 (+2.7) | **81.8** | **79.0** | **70.0** | **65.0** | **74.0** (+14.4) |
-|             | **RLCSD (GT CoT)** | 90.7 | 76.7 | **70.8** | **79.4** (+2.8) | 80.2 | **79.0** | 69.0 | 60.0 | 72.1 (+12.5) |
-| Olmo-3-7B   | Base            | 91.2  | 73.9   | 66.9   | 77.3            | 70.6   | 64.0 | 55.0  | 35.0  | 56.2            |
-|             | GRPO            | 92.4  | 75.8   | **68.9** | 79.0          | 73.8   | 69.0 | 63.0  | 39.0  | 61.2            |
-|             | OPSD            | 92.2  | 75.6   | 66.9   | 78.2            | 72.4   | 69.0 | 62.0  | 38.0  | 60.4            |
-|             | SDPO            | 91.6  | 74.2   | 67.4   | 77.7            | 73.2   | 67.0 | 59.0  | 46.0  | 61.3            |
-|             | SRPO            | 92.1  | 75.0   | 65.3   | 77.5            | 73.2   | 68.0 | 61.0  | 40.0  | 60.6            |
-|             | RLSD            | 92.6  | 74.7   | 66.9   | 78.1            | 73.8   | 65.0 | 61.0  | 38.0  | 59.4            |
-|             | **RLCSD (Self-Roll.)** | **92.7** | **76.1** | 68.6 | **79.1** (+1.8) | **75.4** | **76.0** | **65.0** | **48.0** | **66.1** (+9.9) |
-|             | **RLCSD (GT CoT)** | 92.5 | 73.9 | 67.3 | 77.9 (+0.6) | 70.6 | 65.0 | 61.0 | 37.0 | 58.4 (+2.2) |
+| Model | Method | AMC23 | AIME24 | AIME25 | Math Avg. | KK 4–8 | KK 9 | KK 10 | KK 11 | Logic Avg. |
+|-------|--------|------:|-------:|-------:|----------:|-------:|-----:|------:|------:|-----------:|
+| Qwen3-1.7B | Base | 74.1 | 48.3 | 33.3 | 51.9 | 63.2 | 53.0 | 43.0 | 31.0 | 47.6 |
+|  | GRPO | <u>76.6</u> | <u>51.6</u> | <u>37.2</u> | <u>55.1</u> | 67.4 | <u>59.0</u> | 52.0 | 34.0 | <u>53.1</u> |
+|  | OPSD | 74.6 | 47.2 | 36.1 | 52.6 | 62.0 | <u>59.0</u> | 51.0 | 29.0 | 50.3 |
+|  | SDPO | 73.0 | 42.2 | 31.4 | 48.9 | 63.8 | 56.0 | 52.0 | <u>36.0</u> | 52.0 |
+|  | SRPO | 72.6 | 45.6 | 33.3 | 50.5 | 63.0 | <u>59.0</u> | <u>54.0</u> | 35.0 | 52.8 |
+|  | RLSD | 73.9 | 46.1 | 36.9 | 52.3 | <u>68.0</u> | 57.0 | 49.0 | 32.0 | 51.5 |
+|  | **RLCSD** | **78.2** | **53.1** | **38.3** | **56.5** (+4.6) | **71.8** | **66.0** | **61.0** | **43.0** | **60.5** (+12.9) |
+| Qwen3-4B | Base | 88.6 | 72.5 | 65.3 | 75.5 | 73.2 | 67.0 | 58.0 | 42.0 | 60.1 |
+|  | GRPO | 89.1 | <u>75.8</u> | 66.1 | <u>77.0</u> | 75.4 | 71.0 | 61.0 | 45.0 | 63.1 |
+|  | OPSD | <u>89.4</u> | 73.3 | 65.8 | 76.2 | 73.4 | 71.0 | 61.0 | 42.0 | 61.9 |
+|  | SDPO | 88.2 | 70.3 | 63.6 | 74.0 | 75.8 | 71.0 | 60.0 | 43.0 | 62.5 |
+|  | SRPO | 89.2 | 74.2 | <u>66.7</u> | 76.7 | 74.6 | **76.0** | 59.0 | 47.0 | 64.2 |
+|  | RLSD | 88.9 | 72.5 | 66.1 | 75.8 | <u>76.0</u> | <u>75.0</u> | <u>67.0</u> | <u>49.0</u> | <u>66.8</u> |
+|  | **RLCSD** | **90.8** | **76.4** | **68.1** | **78.4** (+2.9) | **77.6** | **76.0** | **68.0** | **51.0** | **68.2** (+8.1) |
+| Qwen3-8B | Base | 88.8 | 74.2 | 66.9 | 76.6 | 72.4 | 67.0 | 55.0 | 44.0 | 59.6 |
+|  | GRPO | <u>90.1</u> | <u>76.1</u> | <u>69.7</u> | <u>78.6</u> | <u>76.8</u> | 75.0 | 63.0 | 49.0 | 66.0 |
+|  | OPSD | 90.0 | 74.7 | 67.2 | 77.3 | 68.8 | 65.0 | 56.0 | 46.0 | 59.0 |
+|  | SDPO | <u>90.1</u> | 74.2 | 64.7 | 76.3 | 76.4 | <u>78.0</u> | <u>66.0</u> | 46.0 | 66.6 |
+|  | SRPO | 89.4 | 75.6 | 65.8 | 76.9 | 76.6 | 76.0 | 63.0 | 50.0 | 66.4 |
+|  | RLSD | 89.6 | 75.6 | 67.8 | 77.7 | <u>76.8</u> | **79.0** | **67.0** | <u>52.0</u> | <u>68.7</u> |
+|  | **RLCSD** | **91.0** | **76.4** | **70.0** | **79.1** (+2.5) | **78.2** | **79.0** | <u>66.0</u> | **54.0** | **69.3** (+9.7) |
+| Olmo-3-7B | Base | 91.2 | 73.9 | 66.9 | 77.3 | 70.6 | 64.0 | 55.0 | 35.0 | 56.2 |
+|  | GRPO | 92.4 | <u>75.8</u> | **68.9** | <u>79.0</u> | <u>73.8</u> | 69.0 | <u>63.0</u> | 39.0 | 61.2 |
+|  | OPSD | 92.3 | 75.4 | 67.1 | 78.3 | 72.6 | <u>70.0</u> | 61.0 | 39.0 | 60.7 |
+|  | SDPO | 91.8 | 74.3 | 67.2 | 77.8 | 73.4 | 68.0 | 60.0 | <u>45.0</u> | <u>61.6</u> |
+|  | SRPO | 91.9 | 75.2 | 65.6 | 77.6 | 73.0 | 67.0 | 62.0 | 41.0 | 60.8 |
+|  | RLSD | <u>92.5</u> | 74.9 | 66.8 | 78.1 | 73.6 | 66.0 | 60.0 | 37.0 | 59.2 |
+|  | **RLCSD** | **92.7** | **76.1** | <u>68.6</u> | **79.1** (+1.8) | **75.4** | **76.0** | **65.0** | **48.0** | **66.1** (+9.9) |
 
 Math is reported as **mean@12**; Knights & Knaves as **pass@1**. KK 4–8 is the
-in-distribution test set; 9 / 10 / 11 are out-of-distribution role counts. Bold
-numbers mark the best result in each model block.
-Self-rollout is the more stable overall choice and is clearly stronger on
-larger-model logical reasoning, particularly Olmo-3-7B. GT CoT nevertheless
-produces the best Qwen3-1.7B logic average (**61.6**), Qwen3-4B math average
-(**78.4**), and Qwen3-8B math average (**79.4**), showing that the preferred
-positive-hint source remains model- and dataset-dependent.
+in-domain (ID) test set; 9 / 10 / 11 are out-of-domain (OOD) role counts.
+**Bold** marks the best result in each model block, including ties, and
+<u>underline</u> marks the second-highest result. Parentheses in RLCSD's
+average columns show gains over the Base model. RLCSD leads both task-family
+averages for every model, while RLSD scores higher on Qwen3-8B KK 10 and GRPO
+scores higher on Olmo-3-7B AIME25.
 
 ### Training stability
 
-Existing OPSD methods exhibit two characteristic failure modes:
+Figure 5 compares **Qwen3-8B** training on math (top) and Knights & Knaves
+(bottom), showing actor entropy, response length, training reward, and
+validation performance.
 
-- **Entropy explosion → training collapse.** OPSD, SDPO, and SRPO produce
-  rapidly growing actor entropy that destabilizes optimization and manifests as
-  abrupt response-length blow-up and sharp drops in reward and validation
-  accuracy.
-- **Premature length shrinkage.** RLSD steadily decreases response length on
-  math, limiting late-stage performance on long-horizon problems.
-
-RLCSD keeps both entropy and response length stable throughout training while
-achieving stronger final validation performance:
+- **Math:** OPSD, SDPO, SRPO, and RLSD show declining response lengths and
+  limited or deteriorating later-stage validation performance. OPSD and
+  SDPO also exhibit rising entropy and sharp reward drops.
+- **Logic:** length shrinkage is most evident for SDPO; other baselines
+  generally plateau at shorter lengths than RLCSD. OPSD and SDPO show
+  increasing entropy and declining validation accuracy, with a sustained
+  training-reward drop for OPSD.
+- **RLCSD:** training remains stable, response length is preserved on math
+  and gradually increases on logic, and validation performance remains
+  strong. The validation panels report **AIME25 mean@12** and **KK 4–8
+  pass@1**, respectively.
 
 <p align="center">
-  <img src="assets/training_dynamics_qwen3_4b.png" width="95%" alt="Training dynamics on Qwen3-4B"/>
+  <img src="assets/training_dynamics_qwen3_8b.png" width="95%" alt="Figure 5: Qwen3-8B entropy, response length, reward, and validation performance on math and Knights & Knaves"/>
 </p>
 
 ### Contrastive hints as a plug-in component
 
-The contrastive construction is not specific to RLCSD. Applying it on top of
-two representative methods from different families — OPSD (dense distillation)
-and RLSD (advantage modulation) — improves **every** method on nearly every
-metric.
+Table 2 compares two
+privileged-context constructions for OPSD, RLSD, and RLCSD on Qwen3-4B,
+with each method's underlying optimization held fixed:
 
-Concretely, for each method we vary only the source of the privileged signal
-and hold everything else fixed:
+1. **One-sided** — use the dataset-provided GT CoT as the correct privileged
+   context.
+2. **Contrastive** — retain the same GT CoT positive context and additionally
+   use incorrect student rollouts for the same query.
 
-1. **GT CoT (one-sided)** — the positive context is the ground-truth solution
-   from the dataset, with no negative branch.
-2. **Self-Roll. (one-sided)** — the positive context is a correct rollout
-   sampled by the model itself, with no negative branch.
-3. **Self-Roll. (contrastive)** — a correct self-rollout is contrasted against
-   incorrect sibling rollouts. This is what `*_ectr` and RLCSD's default
-   `self_rollout` configuration use.
+Δ is the gain of the contrastive construction over its one-sided counterpart.
+Contrastive contexts improve the math and logic averages for all three
+methods, with no decreases on the individual benchmarks reported here.
+The math / logic average gains are **+1.0 / +0.9** for OPSD,
+**+1.4 / +0.1** for RLSD, and **+3.6 / +6.7** for RLCSD.
 
-These plug-in ablations are distinct from the new RLCSD **GT CoT** variant in
-the main results: that variant remains contrastive, using dataset GT CoT for
-the positive branch and incorrect self-rollouts for the negative branch.
+| Method | Context construction | AMC23 | AIME24 | AIME25 | Math Avg. | KK 4–8 | KK 9 | KK 10 | KK 11 | Logic Avg. |
+|--------|----------------------|------:|-------:|-------:|----------:|-------:|-----:|------:|------:|-----------:|
+| OPSD | One-sided | 89.4 | 73.3 | 65.8 | 76.2 | 73.4 | **71.0** | **61.0** | 42.0 | 61.9 |
+|  | Contrastive | **89.6** | **75.6** | **66.4** | **77.2** | **74.2** | **71.0** | **61.0** | **45.0** | **62.8** |
+|  | Δ | +0.2 | +2.3 | +0.6 | +1.0 | +0.8 | 0.0 | 0.0 | +3.0 | +0.9 |
+| RLSD | One-sided | 88.9 | 72.5 | 66.1 | 75.8 | 76.0 | **75.0** | **67.0** | **49.0** | 66.8 |
+|  | Contrastive | **89.8** | **75.3** | **66.4** | **77.2** | **76.4** | **75.0** | **67.0** | **49.0** | **66.9** |
+|  | Δ | +0.9 | +2.8 | +0.3 | +1.4 | +0.4 | 0.0 | 0.0 | 0.0 | +0.1 |
+| RLCSD | One-sided | 88.9 | 73.1 | 62.5 | 74.8 | 73.8 | 71.0 | 58.0 | 43.0 | 61.5 |
+|  | Contrastive | **90.8** | **76.4** | **68.1** | **78.4** | **77.6** | **76.0** | **68.0** | **51.0** | **68.2** |
+|  | Δ | +1.9 | +3.3 | +5.6 | +3.6 | +3.8 | +5.0 | +10.0 | +8.0 | +6.7 |
 
-Settings (1) and (2) perform essentially the same across all three methods —
-switching the *source* of the one-sided hint barely matters. Setting (3) is
-the one that wins. Δ below is the **gain of (3) over the better of (1) and
-(2)**, averaged across benchmarks (Math = AMC23 + AIME24 + AIME25 mean@12,
-KK = 4–8 + 9 + 10 + 11 pass@1, Qwen3-4B):
+Math is reported as **mean@12** and Knights & Knaves as **pass@1**, with
+KK 4–8 as ID and KK 9–11 as OOD. **Bold** marks the best result within each
+method block, including ties.
 
-|  Method | Δ (Math avg) | Δ (KK avg) |
-|---------|-------------:|-----------:|
-| OPSD    | **+0.2**     | **+2.3**   |
-| RLSD    | **+2.2**     | **+0.5**   |
-| RLCSD   | **+3.0**     | **+5.4**   |
-
-**`opsd_ectr` — OPSD + contrastive token-level signal.** Without contrast,
-OPSD's actor entropy explodes in the late stage (the failure mode above);
-adding the contrastive hint keeps entropy bounded and yields a stable training
-reward.
+**`opsd_ectr` — contrast at the distribution level.** OPSD uses a guided
+teacher target `softmax((1 + α) ℓ_c − α ℓ_w)`, where ℓ<sub>c</sub> and
+ℓ<sub>w</sub> are teacher logits under the correct and incorrect hints.
+A soft mask based on the KL divergence between these distributions gates
+the per-token distillation loss (Equations 18–19). Figure 6 shows **Qwen3-4B
+on Knights & Knaves**: adding contrast curbs entropy growth and stabilizes
+training reward.
 
 <p align="center">
-  <img src="assets/opsd_ectr_effect.png" width="80%" alt="OPSD-ECTR mitigates entropy explosion"/>
+  <img src="assets/opsd_ectr_effect.png" width="80%" alt="Figure 6: one-sided versus contrastive OPSD entropy and training reward on Qwen3-4B Knights & Knaves"/>
 </p>
 
-**`rlsd_ectr` — RLSD + contrastive evidence ratio.** The contrastive signal
-mitigates the length collapse seen in vanilla RLSD on math (left panel below).
-The right panel is an **RLCSD ablation**: removing the contrast from RLCSD
-reproduces the same length-collapse pathology, confirming that the contrastive
-construction is what keeps RLCSD's reasoning traces from shrinking.
+**`rlsd_ectr` — contrast at the scalar modulation level.** The contrastive
+signal replaces the one-sided teacher–student gap used to modulate
+A<sub>ORM</sub>. Figure 7 shows **Qwen3-4B on math**: contrast mitigates
+premature response-length shrinkage for RLSD (left) and RLCSD (right).
+The right panel compares full RLCSD with its one-sided ablation.
 
 <p align="center">
-  <img src="assets/rlsd_ectr_effect.png" width="80%" alt="Contrastive signal preserves response length for both RLSD (left) and RLCSD (right)"/>
+  <img src="assets/rlsd_ectr_effect.png" width="80%" alt="Figure 7: one-sided versus contrastive response lengths for RLSD (left) and RLCSD (right) on Qwen3-4B math"/>
 </p>
 
 These plug-in results are reported only on Qwen3-4B in the paper, and only
 those configs ship here (`configs/{math_deepmath,logic_kk}/qwen3_4b_opsd_ectr.yaml`
 and `qwen3_4b_rlsd_ectr.yaml`).
+
+### Component ablations and broader analysis
+
+On Qwen3-4B, every component removal in Table 3 reduces both task-family
+averages. Removing K-marginalization lowers math / logic averages by
+**1.6 / 3.8 points**; allowing the target rollout into the hint pool lowers
+them by **1.6 / 4.5 points**. Removing verifier anchoring causes the largest
+drop (**2.7 / 5.8 points**), while replacing the two-path loss with a single
+global average costs **2.0 / 4.8 points**.
+
+Section 4.5 extends the task-versus-style analysis to cross-model on-policy
+distillation. Its teacher comparison suggests that a stronger standalone
+teacher can produce a weaker distilled student when the learning signal is
+dominated by stylistic differences. Per-token KL rankings offer a diagnostic
+for teacher selection; the paper does not directly apply RLCSD's hint-based
+contrast to this setting.
 
 ## Built on verl
 

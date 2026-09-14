@@ -63,6 +63,29 @@ def run_ppo(config, task_runner_class=None) -> None:
         # NCCL debug level, VLLM logging level, and allow runtime LoRA updating
         # `num_cpus` specifies the number of CPU cores Ray can use, obtained from the configuration
         default_runtime_env = get_ppo_ray_runtime_env()
+        # The existing multi-node Ray cluster does not inherit the driver's
+        # shared venv path or experiment credentials. Pass them through at
+        # runtime without storing either value in the Hydra config.
+        for env_name in (
+            "PYTHONPATH",
+            "SWANLAB_API_KEY",
+            "SWANLAB_RUN_ID",
+            "SWANLAB_RESUME",
+            "SWANLAB_RUN_ID_RECORD_FILE",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "RLCSD_NCCL_PORT_BASE",
+            # SGLang imports its kernel extension during async replica
+            # registration on the driver; propagate CUDA compatibility
+            # libraries so head nodes without a GPU can still register it.
+            "LD_LIBRARY_PATH",
+        ):
+            if os.environ.get(env_name):
+                default_runtime_env["env_vars"][env_name] = os.environ[env_name]
         ray_init_kwargs = config.ray_kwargs.get("ray_init", {})
         runtime_env_kwargs = ray_init_kwargs.get("runtime_env", {})
 
@@ -74,7 +97,11 @@ def run_ppo(config, task_runner_class=None) -> None:
 
         runtime_env = OmegaConf.merge(default_runtime_env, runtime_env_kwargs)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
-        print(f"ray init kwargs: {ray_init_kwargs}")
+        printable_ray_init_kwargs = OmegaConf.to_container(ray_init_kwargs)
+        printable_env = printable_ray_init_kwargs.get("runtime_env", {}).get("env_vars", {})
+        if "SWANLAB_API_KEY" in printable_env:
+            printable_env["SWANLAB_API_KEY"] = "<redacted>"
+        print(f"ray init kwargs: {printable_ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))
 
     if task_runner_class is None:
